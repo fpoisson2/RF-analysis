@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="20" fill="#111827"/>
+  <g stroke="#22c55e" stroke-width="3" fill="none" stroke-linecap="round">
+    <!-- Antenna tower -->
+    <line x1="50" y1="25" x2="50" y2="80"/>
+    <line x1="50" y1="80" x2="35" y2="90"/>
+    <line x1="50" y1="80" x2="65" y2="90"/>
+    <line x1="42" y1="55" x2="50" y2="45"/>
+    <line x1="58" y1="55" x2="50" y2="45"/>
+    <!-- Signal waves -->
+    <path d="M 60 35 Q 70 25 60 15" opacity="0.9"/>
+    <path d="M 65 40 Q 80 25 65 10" opacity="0.6"/>
+    <path d="M 70 45 Q 90 25 70 5" opacity="0.3"/>
+    <path d="M 40 35 Q 30 25 40 15" opacity="0.9"/>
+    <path d="M 35 40 Q 20 25 35 10" opacity="0.6"/>
+  </g>
+</svg>

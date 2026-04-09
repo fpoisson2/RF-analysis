@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+venv/
+.env
+
+# Node
+node_modules/
+frontend/dist/
+
+# Data (large files - download separately)
+data/srtm/*.hgt
+data/srtm/*.hgt.gz
+data/buildings/*.geojson
+data/landcover/
+data/lidar/
+data/cache/
+data/output/
+data/quebec/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

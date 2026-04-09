@@ -1,0 +1,133 @@
+/* MapLibre GL CSS - must be before tailwind */
+@import 'maplibre-gl/dist/maplibre-gl.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══ Design System Tokens ═══
+   Override these CSS variables to customize the entire look.
+   All colors, fonts, and radii flow through here.
+*/
+:root {
+  /* Brand colors (green by default - change to any hue) */
+  --color-brand-50: #f0fdf4;
+  --color-brand-100: #dcfce7;
+  --color-brand-200: #bbf7d0;
+  --color-brand-300: #86efac;
+  --color-brand-400: #4ade80;
+  --color-brand-500: #22c55e;
+  --color-brand-600: #16a34a;
+  --color-brand-700: #15803d;
+  --color-brand-800: #166534;
+  --color-brand-900: #14532d;
+
+  /* Surface (dark theme backgrounds) */
+  --color-surface-0: #030712;
+  --color-surface-1: #0a0f1a;
+  --color-surface-2: #111827;
+  --color-surface-3: #1f2937;
+  --color-surface-4: #374151;
+
+  /* Typography */
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Spacing & radius */
+  --radius: 0.5rem;
+  --sidebar-width: 320px;
+  --header-height: 48px;
+}
+
+/* ═══ Scrollbar ═══ */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--color-surface-1); }
+::-webkit-scrollbar-thumb { background: var(--color-surface-4); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+
+/* ═══ Form Controls ═══ */
+@layer components {
+  .input-field {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100
+           focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
+           w-full transition-colors placeholder-gray-500;
+  }
+
+  .select-field {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100
+           focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
+           w-full transition-colors appearance-none cursor-pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    padding-right: 2.5rem;
+  }
+
+  .label-text {
+    @apply text-xs font-medium text-gray-400 uppercase tracking-wider;
+  }
+
+  .section-title {
+    @apply text-xs font-semibold text-gray-500 uppercase tracking-widest mb-3;
+  }
+
+  .value-badge {
+    @apply inline-flex items-center px-2 py-1 rounded-md bg-gray-800 text-xs font-mono text-brand-400;
+  }
+
+  .btn-primary {
+    @apply w-full py-3 px-4 rounded-lg font-semibold text-sm
+           bg-brand-600 hover:bg-brand-500 text-white
+           transition-all duration-200
+           disabled:opacity-50 disabled:cursor-not-allowed
+           flex items-center justify-center gap-2;
+  }
+
+  .btn-secondary {
+    @apply px-3 py-2 rounded-lg text-sm font-medium
+           bg-gray-800 hover:bg-gray-700 text-gray-300
+           border border-gray-700 transition-colors;
+  }
+
+  .panel-section {
+    @apply space-y-3 pb-4 mb-4 border-b border-gray-800;
+  }
+}
+
+/* ═══ Number input: hide arrows ═══ */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; }
+
+/* ═══ Range slider ═══ */
+input[type="range"] {
+  @apply w-full h-2 rounded-lg appearance-none cursor-pointer;
+  background: linear-gradient(to right, var(--color-brand-600), var(--color-surface-4));
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-brand-400);
+  border: 2px solid var(--color-surface-2);
+  cursor: pointer;
+}
+
+/* ═══ Animation ═══ */
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+.pulse-marker::before {
+  content: '';
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--color-brand-500);
+  animation: pulse-ring 1.5s ease-out infinite;
+}
