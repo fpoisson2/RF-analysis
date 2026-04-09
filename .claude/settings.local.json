@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /c/Users/franc/OneDrive/Documents/GitHub/RF-analysis/frontend/src/*.tsx)",
+      "WebSearch"
+    ]
+  }
+}
