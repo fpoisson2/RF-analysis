@@ -279,6 +279,149 @@ def render_terrain(lat: float, lon: float, radius_km: float = 2.0,
     }
 
 
+def _srtm_block_read(srtm_mgr, lat_min, lon_min, lat_max, lon_max, out_size):
+    """Fast SRTM block read: slice HGT arrays directly instead of point-by-point."""
+    from PIL import Image as _Img
+
+    # Collect unique tiles needed
+    lat_tiles = range(math.floor(lat_min), math.floor(lat_max) + 1)
+    lon_tiles = range(math.floor(lon_min), math.floor(lon_max) + 1)
+
+    # Build a merged grid covering the full extent
+    rows_total = 0
+    cols_total = 0
+    tile_data = {}
+    tile_size = None
+
+    for tlat in lat_tiles:
+        for tlon in lon_tiles:
+            t = srtm_mgr._get_tile(tlat, tlon)
+            if t is not None:
+                data, sz = t
+                tile_data[(tlat, tlon)] = data
+                tile_size = sz
+            else:
+                tile_data[(tlat, tlon)] = None
+
+    if tile_size is None:
+        # No SRTM data at all — return flat grid
+        return np.zeros((out_size, out_size), dtype=np.float32)
+
+    n_lat = len(lat_tiles)
+    n_lon = len(lon_tiles)
+    merged = np.zeros((n_lat * tile_size, n_lon * tile_size), dtype=np.float32)
+
+    sorted_lats = sorted(lat_tiles, reverse=True)  # top (north) first
+    sorted_lons = sorted(lon_tiles)
+
+    for ri, tlat in enumerate(sorted_lats):
+        for ci, tlon in enumerate(sorted_lons):
+            d = tile_data.get((tlat, tlon))
+            if d is not None:
+                merged[ri * tile_size:(ri + 1) * tile_size,
+                       ci * tile_size:(ci + 1) * tile_size] = d
+
+    # Map pixel coords for the requested extent
+    total_lat_max = max(sorted_lats) + 1
+    total_lon_min = min(sorted_lons)
+    total_lat_min = min(sorted_lats)
+    total_lon_max = max(sorted_lons) + 1
+
+    # Row/col in merged array
+    r_start = int((total_lat_max - lat_max) / (total_lat_max - total_lat_min) * merged.shape[0])
+    r_end = int((total_lat_max - lat_min) / (total_lat_max - total_lat_min) * merged.shape[0])
+    c_start = int((lon_min - total_lon_min) / (total_lon_max - total_lon_min) * merged.shape[1])
+    c_end = int((lon_max - total_lon_min) / (total_lon_max - total_lon_min) * merged.shape[1])
+
+    r_start = max(0, min(r_start, merged.shape[0] - 1))
+    r_end = max(r_start + 1, min(r_end, merged.shape[0]))
+    c_start = max(0, min(c_start, merged.shape[1] - 1))
+    c_end = max(c_start + 1, min(c_end, merged.shape[1]))
+
+    block = merged[r_start:r_end, c_start:c_end]
+    block[block <= -32768] = 0.0
+
+    # Resize to output size
+    if block.shape[0] != out_size or block.shape[1] != out_size:
+        img = _Img.fromarray(block)
+        img = img.resize((out_size, out_size), _Img.BILINEAR)
+        block = np.array(img, dtype=np.float32)
+
+    return block
+
+
+@app.get("/api/terrain/dem/{z}/{x}/{y}.png")
+def terrain_dem_tile(z: int, x: int, y: int, mode: str = "terrain"):
+    """
+    Serve raster-dem tiles in Mapbox Terrain-RGB encoding for MapLibre setTerrain().
+    Uses LiDAR (MNS/MNT) with SRTM fallback.
+    mode: 'terrain' (DTM ground), 'surface' (DSM ground+canopy)
+    Encoding: elevation = -10000 + (R*256*256 + G*256 + B) * 0.1
+    """
+    import io as _io
+    from PIL import Image as _Image
+
+    tile_size = 256
+
+    # Tile bounds (Web Mercator → WGS84)
+    n = 2 ** z
+    lon_min = x / n * 360.0 - 180.0
+    lon_max = (x + 1) / n * 360.0 - 180.0
+    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+
+    use_canopy = mode == "surface"
+
+    # Try LiDAR block read first (fast)
+    ds_type = "mnt"
+    grid = None
+    if hasattr(terrain, 'read_block'):
+        block = terrain.read_block(lat_min, lon_min, lat_max, lon_max,
+                                    dataset_type=ds_type, max_pixels=tile_size)
+        if block is not None:
+            grid = block[0]
+            if use_canopy:
+                canopy_block = terrain.read_block(lat_min, lon_min, lat_max, lon_max,
+                                                   dataset_type="mhc", max_pixels=tile_size)
+                if canopy_block is not None:
+                    cb = canopy_block[0]
+                    if cb.shape != grid.shape:
+                        cb_img = _Image.fromarray(cb)
+                        cb_img = cb_img.resize((grid.shape[1], grid.shape[0]), _Image.BILINEAR)
+                        cb = np.array(cb_img)
+                    grid = grid + np.maximum(cb, 0)
+
+    # Fallback: SRTM direct array slicing (fast)
+    if grid is None:
+        grid = _srtm_block_read(srtm, lat_min, lon_min, lat_max, lon_max, tile_size)
+
+    # Resize to tile_size if needed
+    if grid.shape[0] != tile_size or grid.shape[1] != tile_size:
+        img_tmp = _Image.fromarray(grid)
+        img_tmp = img_tmp.resize((tile_size, tile_size), _Image.BILINEAR)
+        grid = np.array(img_tmp, dtype=np.float32)
+
+    # Encode as Mapbox Terrain-RGB: val = (elev + 10000) * 10
+    grid = np.nan_to_num(grid, nan=0.0)
+    val = ((grid + 10000.0) * 10.0).astype(np.int32)
+    val = np.clip(val, 0, 256 * 256 * 256 - 1)
+
+    r_ch = (val >> 16) & 0xFF
+    g_ch = (val >> 8) & 0xFF
+    b_ch = val & 0xFF
+
+    image = np.stack([r_ch, g_ch, b_ch], axis=-1).astype(np.uint8)
+
+    img = _Image.fromarray(image, "RGB")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf, media_type="image/png",
+                             headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/api/elevation")
 def get_elevation(lat: float, lon: float):
     """Get terrain elevation at a point."""
@@ -352,14 +495,13 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
     lat_range = radius_km / 111.32
     lon_range = radius_km / (111.32 * cos_lat)
 
-    filtered = []
+    # Pass 1: filter by bounding box, collect centroids
+    candidates = []
     for feature in data.get("features", []):
         geom = feature.get("geometry")
         if geom is None:
             continue
         coords = geom.get("coordinates", [])
-
-        # Get centroid
         try:
             if geom["type"] == "Polygon":
                 ring = coords[0]
@@ -367,35 +509,89 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
                 ring = coords[0][0]
             else:
                 continue
-
             clat = sum(p[1] for p in ring) / len(ring)
             clon = sum(p[0] for p in ring) / len(ring)
-
             if abs(clat - lat) <= lat_range and abs(clon - lon) <= lon_range:
-                # Add height info
-                props = feature.get("properties", {})
-                height = None
-                for hk in ["ELEVATION", "HAUTEUR", "hauteur", "HEIGHT", "NB_ETAGES"]:
-                    if hk in props and props[hk]:
-                        try:
-                            val = float(props[hk])
-                            height = val if hk != "NB_ETAGES" else val * 3.0
-                            break
-                        except (ValueError, TypeError):
-                            pass
-                if height is None:
-                    height = 8.0
-
-                filtered.append({
-                    "type": "Feature",
-                    "geometry": geom,
-                    "properties": {**props, "_height": height},
-                })
+                candidates.append((feature, clat, clon))
         except (IndexError, KeyError, TypeError):
             continue
 
+    # Pass 2: batch LiDAR height lookup via block read
+    mhc_grid = None
+    mhc_meta = None
+    if candidates and hasattr(terrain, 'read_block'):
+        all_lats = [c[1] for c in candidates]
+        all_lons = [c[2] for c in candidates]
+        blk_lat_min, blk_lat_max = min(all_lats), max(all_lats)
+        blk_lon_min, blk_lon_max = min(all_lons), max(all_lons)
+        # Add small padding
+        pad = 0.001
+        try:
+            block = terrain.read_block(blk_lat_min - pad, blk_lon_min - pad,
+                                        blk_lat_max + pad, blk_lon_max + pad,
+                                        dataset_type="mhc", max_pixels=2000)
+            if block is not None:
+                mhc_grid, mhc_meta = block
+        except Exception:
+            pass
+
+    def _sample_mhc(clat, clon):
+        """Sample canopy height from block-read grid."""
+        if mhc_grid is None or mhc_meta is None:
+            return None
+        lat_min_b = mhc_meta.get("lat_min", mhc_meta.get("south", 0))
+        lat_max_b = mhc_meta.get("lat_max", mhc_meta.get("north", 0))
+        lon_min_b = mhc_meta.get("lon_min", mhc_meta.get("west", 0))
+        lon_max_b = mhc_meta.get("lon_max", mhc_meta.get("east", 0))
+        if lat_max_b <= lat_min_b or lon_max_b <= lon_min_b:
+            return None
+        r = int((lat_max_b - clat) / (lat_max_b - lat_min_b) * mhc_grid.shape[0])
+        c = int((clon - lon_min_b) / (lon_max_b - lon_min_b) * mhc_grid.shape[1])
+        r = max(0, min(r, mhc_grid.shape[0] - 1))
+        c = max(0, min(c, mhc_grid.shape[1] - 1))
+        val = float(mhc_grid[r, c])
+        return val if val > 2.0 else None
+
+    # Pass 3: assign heights
+    filtered = []
+    for feature, clat, clon in candidates:
+        props = feature.get("properties", {})
+        height = None
+
+        # Try explicit height properties
+        for hk in ["ELEVATION", "HAUTEUR", "hauteur", "HEIGHT", "NB_ETAGES"]:
+            if hk in props and props[hk]:
+                try:
+                    val = float(props[hk])
+                    height = val if hk != "NB_ETAGES" else val * 3.0
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+        # Try LiDAR canopy height
+        if height is None:
+            lidar_h = _sample_mhc(clat, clon)
+            if lidar_h is not None:
+                height = round(lidar_h, 1)
+
+        # Fallback by building type
+        if height is None:
+            btype = (props.get("TYPE_BATIMENT") or "").lower()
+            if "commercial" in btype or "industriel" in btype:
+                height = 12.0
+            elif "institutionnel" in btype or "public" in btype:
+                height = 15.0
+            else:
+                height = 8.0
+
+        filtered.append({
+            "type": "Feature",
+            "geometry": feature["geometry"],
+            "properties": {**props, "_height": height},
+        })
+
     return {
         "type": "FeatureCollection",
-        "features": filtered[:10000],  # Limit for performance
+        "features": filtered[:25000],  # Limit for performance
         "total_in_area": len(filtered),
     }
