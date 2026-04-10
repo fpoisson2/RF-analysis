@@ -135,11 +135,9 @@ export const MapView = React.memo(function MapView({
       maxPitch: 85,
     });
 
-    // Globe projection: shows the earth as a sphere when zoomed far out
-    try { (map as any).setProjection?.({ type: 'globe' }); } catch (e) { /* not supported */ }
-
-    // Atmosphere / stars for globe view
-    map.on('style.load', () => {
+    // Globe projection + atmosphere (deferred until style is ready)
+    map.on('load', () => {
+      try { (map as any).setProjection?.({ type: 'globe' }); } catch (e) { /* not supported */ }
       try {
         (map as any).setFog?.({
           color: 'rgb(186, 210, 235)',
@@ -157,6 +155,9 @@ export const MapView = React.memo(function MapView({
     map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
 
     map.on('click', (e) => {
+      // Only move TX when clicking directly on the map canvas, not overlay buttons
+      const target = (e.originalEvent as MouseEvent)?.target as HTMLElement;
+      if (target && !target.closest('.maplibregl-canvas')) return;
       onMapClickRef.current(e.lngLat.lat, e.lngLat.lng);
     });
 
@@ -326,33 +327,14 @@ export const MapView = React.memo(function MapView({
       .finally(() => setLoadingTerrain(false));
   }, [terrainLayer, txPosition[0], txPosition[1], radius]);
 
-  // 3D view: toggle pitch + fill-extrusion buildings layer
+  // 3D toggle: camera tilt + terrain DEM
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    const removeBuildings = () => {
-      if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
-      if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
-    };
-
-    if (!view3D) {
-      if (map.isStyleLoaded()) {
-        removeBuildings();
-        // Remove 3D terrain
-        try { (map as any).setTerrain?.(null); } catch (e) { /* ignore */ }
-        if (map.getSource('terrain-dem')) map.removeSource('terrain-dem');
-      }
-      map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
-      setBuildingsLoaded(false);
-      return;
-    }
-
-    // Enable 3D: tilt the camera and fetch buildings around the TX
-    map.easeTo({ pitch: 60, bearing: -20, duration: 800 });
-
-    // 3D terrain via free AWS/Mapzen DEM tiles
-    const addTerrain = () => {
+    if (view3D) {
+      map.easeTo({ pitch: 60, bearing: -20, duration: 800 });
+      // Enable 3D terrain
       try {
         if (!map.getSource('terrain-dem')) {
           map.addSource('terrain-dem', {
@@ -364,31 +346,44 @@ export const MapView = React.memo(function MapView({
           });
         }
         (map as any).setTerrain?.({ source: 'terrain-dem', exaggeration: 1.5 });
-      } catch (e) {
-        console.warn('3D terrain not supported:', e);
-      }
-    };
-    if (map.isStyleLoaded()) addTerrain();
-    else map.once('load', addTerrain);
+      } catch (e) { console.warn('3D terrain failed:', e); }
+    } else {
+      map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
+      try {
+        (map as any).setTerrain?.(null);
+      } catch (e) { /* ignore */ }
+    }
+  }, [view3D]);
 
+  // 3D buildings: always loaded around TX position.
+  // Buildings appear as fill-extrusion (visible from any camera angle).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    let cancelled = false;
     const lat = txPosition[1];
     const lon = txPosition[0];
-    // Fetch buildings for a generous area around TX.
-    // The backend caps the number of features so very large radii
-    // won't blow up the browser.
     const buildingsRadius = Math.min(Math.max(radius, 1), 15);
 
-    fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(async (data) => {
-        if (!data || !map || !data.features) return;
+    const removeBuildings = () => {
+      try {
+        if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
+        if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
+      } catch (e) { /* ignore */ }
+    };
 
-        // Prepare building features with height
+    const loadBuildings = async () => {
+      try {
+        const bResp = await fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`);
+        if (!bResp.ok || cancelled) return;
+        const data = await bResp.json();
+        if (!data?.features || cancelled) return;
+
         const features = data.features
           .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
           .map((f: any) => {
             const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
-            // Compute centroid from first ring
             const ring = f.geometry.type === 'Polygon'
               ? f.geometry.coordinates[0]
               : f.geometry.coordinates[0][0];
@@ -400,7 +395,9 @@ export const MapView = React.memo(function MapView({
             };
           });
 
-        // Batch-query the coverage engine for rooftop signal values
+        if (cancelled || features.length === 0) return;
+
+        // Batch-query signal values for rooftop coloring
         try {
           const buildingsIn = features.map((f: any) => ({
             lat: f.properties.centroid_lat,
@@ -412,63 +409,72 @@ export const MapView = React.memo(function MapView({
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ buildings: buildingsIn }),
           });
-          if (sigResp.ok) {
+          if (sigResp.ok && !cancelled) {
             const sigData = await sigResp.json();
             const results = sigData.results || [];
-            for (let i = 0; i < features.length && i < results.length; i++) {
-              features[i].properties.signal_roof = results[i].signal_roof;
-              features[i].properties.signal_street = results[i].signal_street;
-              features[i].properties.delta_db = results[i].delta_db;
+            for (let idx = 0; idx < features.length && idx < results.length; idx++) {
+              features[idx].properties.signal_roof = results[idx].signal_roof;
+              features[idx].properties.signal_street = results[idx].signal_street;
+              features[idx].properties.delta_db = results[idx].delta_db;
             }
           }
         } catch (e) {
-          // Not fatal — buildings just won't have signal colors
           console.warn('buildings3d signal query failed', e);
         }
 
-        const add = () => {
-          removeBuildings();
-          map.addSource('buildings-3d-source', {
-            type: 'geojson',
-            data: { type: 'FeatureCollection', features },
-          });
+        if (cancelled || !map) return;
 
-          // Color buildings by rooftop signal: red=strong, blue=weak, gray=no data
-          map.addLayer({
-            id: 'buildings-3d',
-            type: 'fill-extrusion',
-            source: 'buildings-3d-source',
-            paint: {
-              'fill-extrusion-color': [
-                'case',
-                ['has', 'signal_roof'],
-                [
-                  'interpolate', ['linear'], ['get', 'signal_roof'],
-                  -120, '#461eaa',  // weak - violet
-                  -100, '#0082d2',  // marginal - cyan-blue
-                  -90,  '#00b478',  // teal-green
-                  -80,  '#64e114',  // green
-                  -70,  '#dcf000',  // yellow-green
-                  -60,  '#ffbe00',  // amber
-                  -50,  '#ff6e00',  // orange
-                  -30,  '#ff1e1e',  // strong - red
-                ],
-                '#9ca3af',  // no coverage data - gray
+        removeBuildings();
+        map.addSource('buildings-3d-source', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features },
+        });
+        map.addLayer({
+          id: 'buildings-3d',
+          type: 'fill-extrusion',
+          source: 'buildings-3d-source',
+          paint: {
+            'fill-extrusion-color': [
+              'case',
+              ['has', 'signal_roof'],
+              [
+                'interpolate', ['linear'], ['get', 'signal_roof'],
+                -120, '#461eaa',
+                -100, '#0082d2',
+                -90,  '#00b478',
+                -80,  '#64e114',
+                -70,  '#dcf000',
+                -60,  '#ffbe00',
+                -50,  '#ff6e00',
+                -30,  '#ff1e1e',
               ],
-              'fill-extrusion-height': ['get', 'height'],
-              'fill-extrusion-base': 0,
-              'fill-extrusion-opacity': 0.85,
-            },
-          });
-          setBuildingsLoaded(true);
-        };
+              '#9ca3af',
+            ],
+            'fill-extrusion-height': ['get', 'height'],
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.85,
+          },
+        });
+        setBuildingsLoaded(true);
+        console.log(`3D buildings loaded: ${features.length} features`);
+      } catch (e) {
+        console.error('3D buildings failed:', e);
+      }
+    };
 
-        if (map.isStyleLoaded()) add();
-        else map.once('load', add);
-      })
-      .catch(console.error);
+    // Wait for map to be fully loaded before adding buildings
+    if (map.isStyleLoaded()) {
+      loadBuildings();
+    } else {
+      map.once('load', () => { if (!cancelled) loadBuildings(); });
+    }
+
+    return () => {
+      cancelled = true;
+      removeBuildings();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view3D, txPosition[0], txPosition[1], radius]);
+  }, [txPosition[0], txPosition[1], radius]);
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
   const fr = locale === 'fr';
@@ -477,8 +483,12 @@ export const MapView = React.memo(function MapView({
     <div className="flex-1 relative overflow-hidden">
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
 
-      {/* Layer control buttons */}
-      <div className="absolute top-4 left-2 z-10 flex flex-col gap-1">
+      {/* Layer control buttons — stopPropagation prevents clicks reaching the map */}
+      <div
+        className="absolute top-4 left-2 z-10 flex flex-col gap-1"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
         <button
           onClick={() => setLayerMenuOpen(!layerMenuOpen)}
           className={`p-2 rounded-lg shadow-lg border transition-colors ${

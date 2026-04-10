@@ -42,7 +42,12 @@
       "Bash(python -c \"from app.coverage.engine import CoverageEngine; from app.propagation.models import free_space; from app.coverage.cuda_kernels import DIFFRACTION_KERNEL_SRC; print\\(''All imports OK''\\)\")",
       "Bash(npx tsc:*)",
       "Bash(curl -s \"http://localhost:8000/api/data/buildings?lat=46.8&lon=-71.2&radius_km=3\")",
-      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f''''{len\\(d[\"\"features\"\"]\\)} buildings OK''''\\)\")"
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f''''{len\\(d[\"\"features\"\"]\\)} buildings OK''''\\)\")",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(powershell -Command 'Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue')",
+      "Bash(powershell -Command \"Get-Process | Where-Object {$_ProcessName -like ''*node*''} | Select-Object Id, ProcessName, Path | Format-Table\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(curl -s http://localhost:5174)"
     ]
   }
 }
