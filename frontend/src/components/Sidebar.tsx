@@ -232,24 +232,28 @@ function SignalPanel({ signal, setSignal, feeder, setFeeder, erp_w, erp_dbm, eir
       <h3 className="section-title">{i('sig.title')}</h3>
       <div className="space-y-3">
         <Field label={i('sig.frequency')} unit="MHz">
-          <input type="number" step="0.1" min="2" max="90000" className="input-field"
-                 value={signal.frequency} onChange={e => setSignal({ ...signal, frequency: parseFloat(e.target.value) || 155 })} />
+          <NumberInput step="0.1" min="2" max="90000" className="input-field"
+                 value={signal.frequency} fallback={155}
+                 onChange={v => setSignal({ ...signal, frequency: v })} />
         </Field>
         <Field label={i('sig.power')} unit="W">
-          <input type="number" step="0.1" min="0.001" max="10000" className="input-field"
-                 value={signal.power} onChange={e => setSignal({ ...signal, power: parseFloat(e.target.value) || 1 })} />
+          <NumberInput step="0.1" min="0.001" max="10000" className="input-field"
+                 value={signal.power} fallback={1}
+                 onChange={v => setSignal({ ...signal, power: v })} />
         </Field>
         <Field label={i('sig.bandwidth')} unit="MHz">
-          <input type="number" step="0.01" min="0.001" max="200" className="input-field"
-                 value={signal.bandwidth} onChange={e => setSignal({ ...signal, bandwidth: parseFloat(e.target.value) || 0.25 })} />
+          <NumberInput step="0.01" min="0.001" max="200" className="input-field"
+                 value={signal.bandwidth} fallback={0.25}
+                 onChange={v => setSignal({ ...signal, bandwidth: v })} />
         </Field>
       </div>
 
       <div className="panel-section mt-4">
         <div className="label-text mb-2">{i('feed.title')}</div>
         <Field label={i('feed.loss')} unit="dB">
-          <input type="number" step="0.1" min="0" max="30" className="input-field"
-                 value={feeder.loss} onChange={e => setFeeder({ loss: parseFloat(e.target.value) || 0 })} />
+          <NumberInput step="0.1" min="0" max="30" className="input-field"
+                 value={feeder.loss} fallback={0}
+                 onChange={v => setFeeder({ loss: v })} />
         </Field>
       </div>
 
@@ -290,28 +294,33 @@ function AntennaPanel({ antenna, setAntenna, i }: PanelProps) {
           </select>
         </Field>
         <Field label={i('ant.gain')} unit="dBi">
-          <input type="number" step="0.1" min="-30" max="50" className="input-field"
-                 value={antenna.gain} onChange={e => setAntenna({ ...antenna, gain: parseFloat(e.target.value) || 0 })} />
+          <NumberInput step="0.1" min="-30" max="50" className="input-field"
+                 value={antenna.gain} fallback={0}
+                 onChange={v => setAntenna({ ...antenna, gain: v })} />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label={i('ant.azimuth')} unit="deg">
-            <input type="number" step="1" min="0" max="360" className="input-field"
-                   value={antenna.azimuth} onChange={e => setAntenna({ ...antenna, azimuth: parseFloat(e.target.value) || 0 })} />
+            <NumberInput step="1" min="0" max="360" className="input-field"
+                   value={antenna.azimuth} fallback={0}
+                   onChange={v => setAntenna({ ...antenna, azimuth: v })} />
           </Field>
           <Field label={i('ant.tilt')} unit="deg">
-            <input type="number" step="0.5" min="-90" max="90" className="input-field"
-                   value={antenna.tilt} onChange={e => setAntenna({ ...antenna, tilt: parseFloat(e.target.value) || 0 })} />
+            <NumberInput step="0.5" min="-90" max="90" className="input-field"
+                   value={antenna.tilt} fallback={0}
+                   onChange={v => setAntenna({ ...antenna, tilt: v })} />
           </Field>
         </div>
         {antenna.pattern_type === 'custom' && (
           <div className="grid grid-cols-2 gap-3">
             <Field label={i('ant.h_beamwidth')} unit="deg">
-              <input type="number" step="1" min="1" max="360" className="input-field"
-                     value={antenna.h_beamwidth} onChange={e => setAntenna({ ...antenna, h_beamwidth: parseFloat(e.target.value) || 360 })} />
+              <NumberInput step="1" min="1" max="360" className="input-field"
+                     value={antenna.h_beamwidth} fallback={360}
+                     onChange={v => setAntenna({ ...antenna, h_beamwidth: v })} />
             </Field>
             <Field label={i('ant.v_beamwidth')} unit="deg">
-              <input type="number" step="1" min="1" max="180" className="input-field"
-                     value={antenna.v_beamwidth} onChange={e => setAntenna({ ...antenna, v_beamwidth: parseFloat(e.target.value) || 90 })} />
+              <NumberInput step="1" min="1" max="180" className="input-field"
+                     value={antenna.v_beamwidth} fallback={90}
+                     onChange={v => setAntenna({ ...antenna, v_beamwidth: v })} />
             </Field>
           </div>
         )}
@@ -326,16 +335,19 @@ function RxPanel({ rx, setRx, i }: PanelProps) {
       <h3 className="section-title">{i('rx.title')}</h3>
       <div className="space-y-3">
         <Field label={i('rx.height')} unit="m">
-          <input type="number" step="0.5" min="0.1" max="60000" className="input-field"
-                 value={rx.height} onChange={e => setRx({ ...rx, height: parseFloat(e.target.value) || 1.5 })} />
+          <NumberInput step="0.5" min="0.1" max="60000" className="input-field"
+                 value={rx.height} fallback={1.5}
+                 onChange={v => setRx({ ...rx, height: v })} />
         </Field>
         <Field label={i('rx.gain')} unit="dBi">
-          <input type="number" step="0.5" min="-30" max="50" className="input-field"
-                 value={rx.gain} onChange={e => setRx({ ...rx, gain: parseFloat(e.target.value) || 0 })} />
+          <NumberInput step="0.5" min="-30" max="50" className="input-field"
+                 value={rx.gain} fallback={0}
+                 onChange={v => setRx({ ...rx, gain: v })} />
         </Field>
         <Field label={i('rx.sensitivity')} unit="dBm">
-          <input type="number" step="1" min="-200" max="0" className="input-field"
-                 value={rx.sensitivity} onChange={e => setRx({ ...rx, sensitivity: parseFloat(e.target.value) || -90 })} />
+          <NumberInput step="1" min="-200" max="0" className="input-field"
+                 value={rx.sensitivity} fallback={-90}
+                 onChange={v => setRx({ ...rx, sensitivity: v })} />
         </Field>
       </div>
     </>
@@ -404,8 +416,9 @@ function EnvPanel({ env, setEnv, i }: PanelProps) {
           </select>
         </Field>
         <Field label={i('env.noise_floor')} unit="dBm">
-          <input type="number" step="1" min="-174" max="0" className="input-field"
-                 value={env.noise_floor} onChange={e => setEnv({ ...env, noise_floor: parseFloat(e.target.value) || -100 })} />
+          <NumberInput step="1" min="-174" max="0" className="input-field"
+                 value={env.noise_floor} fallback={-100}
+                 onChange={v => setEnv({ ...env, noise_floor: v })} />
         </Field>
       </div>
     </>
@@ -431,8 +444,9 @@ function OutputPanel({ output, setOutput, megapixels, i, locale }: PanelProps) {
           </select>
         </Field>
         <Field label={i('out.radius')} unit="km">
-          <input type="number" step="1" min="0.1" max="500" className="input-field"
-                 value={output.radius} onChange={e => setOutput({ ...output, radius: parseFloat(e.target.value) || 10 })} />
+          <NumberInput step="1" min="0.1" max="500" className="input-field"
+                 value={output.radius} fallback={10}
+                 onChange={v => setOutput({ ...output, radius: v })} />
         </Field>
         <Field label={i('rx.units')}>
           <select className="select-field" value={output.units}
