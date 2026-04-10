@@ -20,6 +20,7 @@ from ..propagation.models import get_model, free_space
 from ..propagation.diffraction import get_diffraction_model, fresnel_zone_radius
 from ..antenna.patterns import get_pattern_by_type, get_antenna_gain
 from ..terrain.srtm import SRTMManager, haversine_distance, destination_point, bearing
+from .cuda_kernels import compute_diffraction_grid_gpu, compute_diffraction_grid_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -290,63 +291,56 @@ class CoverageEngine:
         base_path_loss = prop_model(dist_km_clipped, freq, tx_h, rx_h, reliability=reliability)
         base_path_loss = np.asarray(base_path_loss, dtype=np.float32)
 
-        # Vectorized antenna gain (lookup from pattern)
-        az_idx = (az_grid.astype(int) % 360).ravel()
-        ant_gains = np.array([pattern[a, 90] for a in az_idx], dtype=np.float32).reshape(n_cells, n_cells)
+        # Vectorized antenna gain (fancy-indexed lookup, ~250x faster than list comp)
+        pattern_slice = np.asarray(pattern[:360, 90], dtype=np.float32)  # (360,) az slice at 0° elev
+        az_idx = (az_grid.astype(np.int32) % 360)
+        ant_gains = pattern_slice[az_idx]
 
         # Base link budget (vectorized)
         rx_power = tx_power_dbm - feeder_loss + ant_gains - base_path_loss + rx_gain
 
-        # Now add terrain diffraction correction via radial sampling
-        # Use fewer azimuths but sample each properly
-        n_azimuths = 720
-        n_profile_pts = min(40, max(8, int(radius_km * 1.5)))
-
-        # For each azimuth, compute diffraction loss along a ray,
-        # then apply it to all pixels near that azimuth
+        # ── Per-pixel terrain-aware knife-edge diffraction (CUDA) ──
+        # Replaces the old radial-sweep with profile quantised to ~15 pts,
+        # which flattened detail in the first ~600 m around the transmitter.
         diff_grid = np.zeros((n_cells, n_cells), dtype=np.float32)
 
         if use_diffraction:
-            for az_i in range(n_azimuths):
-                az_deg = az_i * 360.0 / n_azimuths
-                az_rad = math.radians(az_deg)
+            t_diff = time.time()
+            tx_ground = float(sample_elevation(tx_lat, tx_lon))
+            diff_backend = "CPU"
 
-                # End point of ray
-                end_lat = tx_lat + math.cos(az_rad) * half_lat * 2 * (radius_km * 1000) / (2 * radius_km * 1000)
-                end_lon = tx_lon + math.sin(az_rad) * half_lon * 2 * (radius_km * 1000) / (2 * radius_km * 1000)
+            if GPU_AVAILABLE:
+                try:
+                    diff_grid = compute_diffraction_grid_gpu(
+                        elev_grid,
+                        lat_min, lat_max, lon_min, lon_max,
+                        tx_lat, tx_lon, tx_ground, tx_h,
+                        rx_h, freq,
+                        n_cells, radius_m_val, cos_lat,
+                    )
+                    diff_backend = "CUDA"
+                except Exception as e:
+                    logger.warning(f"CUDA diffraction kernel failed: {e}; falling back to CPU")
+                    diff_grid = compute_diffraction_grid_cpu(
+                        elev_grid,
+                        lat_min, lat_max, lon_min, lon_max,
+                        tx_lat, tx_lon, tx_ground, tx_h,
+                        rx_h, freq,
+                        n_cells, radius_m_val, cos_lat,
+                        pixel_lats, pixel_lons, dist_m,
+                    )
+            else:
+                diff_grid = compute_diffraction_grid_cpu(
+                    elev_grid,
+                    lat_min, lat_max, lon_min, lon_max,
+                    tx_lat, tx_lon, tx_ground, tx_h,
+                    rx_h, freq,
+                    n_cells, radius_m_val, cos_lat,
+                    pixel_lats, pixel_lons, dist_m,
+                )
 
-                # Terrain profile from pre-loaded grid
-                p_rows = np.linspace(center, center - math.cos(az_rad) * center, n_profile_pts).astype(int)
-                p_cols = np.linspace(center, center + math.sin(az_rad) * center, n_profile_pts).astype(int)
-                p_rows = np.clip(p_rows, 0, terrain_h - 1)
-                p_cols = np.clip(p_cols, 0, terrain_w - 1)
-                profile_h = elev_grid[p_rows, p_cols]
-                profile_d = np.linspace(0, radius_km * 1000, n_profile_pts)
-
-                # Compute cumulative diffraction loss along this ray
-                ray_diff = np.zeros(n_profile_pts)
-                for p_i in range(2, n_profile_pts):
-                    sub_h = profile_h[:p_i+1]
-                    sub_d = profile_d[:p_i+1]
-                    try:
-                        ray_diff[p_i] = float(diff_model(sub_d, sub_h, tx_h, rx_h, freq))
-                    except Exception:
-                        ray_diff[p_i] = ray_diff[p_i-1]
-
-                # Apply to pixels in this azimuth slice
-                az_low = (az_deg - 360.0 / n_azimuths / 2) % 360
-                az_high = (az_deg + 360.0 / n_azimuths / 2) % 360
-
-                if az_low < az_high:
-                    az_mask = (az_grid >= az_low) & (az_grid < az_high) & circle_mask
-                else:  # Wraps around 0/360
-                    az_mask = ((az_grid >= az_low) | (az_grid < az_high)) & circle_mask
-
-                if np.any(az_mask):
-                    # Map pixel distance to profile index
-                    pixel_frac = dist_m[az_mask] / radius_m_val
-                    pixel_prof_idx = np.clip((pixel_frac * (n_profile_pts - 1)).astype(int), 0, n_profile_pts - 1)
-                    diff_grid[az_mask] = ray_diff[pixel_prof_idx]
+            t_diff_ms = (time.time() - t_diff) * 1000
+            logger.info(f"  Diffraction ({diff_backend}, per-pixel): {t_diff_ms:.0f}ms")
 
         # Apply diffraction to link budget
         rx_power -= diff_grid
@@ -362,7 +356,7 @@ class CoverageEngine:
             grid = np.where(circle_mask & (rx_power >= sensitivity), rx_power, np.nan)
 
         t_sweep = (time.time() - t2) * 1000
-        logger.info(f"  Compute ({n_azimuths} diffraction rays): {t_sweep:.0f}ms")
+        logger.info(f"  Link budget + mask: {t_sweep:.0f}ms")
 
         # ── Step 3: Render heatmap ────────────────────────────────
         t3 = time.time()

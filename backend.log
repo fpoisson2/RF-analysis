@@ -1,0 +1,16 @@
+2026-04-09 23:12:44,533 [INFO] app.terrain.lidar_terrain: LiDAR: 8 MNT tiles indexed, 8 with MHC
+2026-04-09 23:12:44,533 [INFO] app.coverage.engine: CoverageEngine: GPU acceleration ENABLED
+INFO:     Started server process [29476]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:56524 - "GET /api/health HTTP/1.1" 200 OK
+2026-04-09 23:14:18,813 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:14:18,829 [INFO] app.coverage.engine: Coverage: 2000x2000 @ 10m | Terrain: 2000x2000 [LiDAR] 2090ms
+2026-04-09 23:14:19,143 [INFO] app.coverage.cuda_kernels: CUDA diffraction kernel compiled
+2026-04-09 23:14:19,192 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 52ms
+2026-04-09 23:14:19,199 [INFO] app.coverage.engine:   Link budget + mask: 370ms
+2026-04-09 23:14:21,296 [INFO] app.coverage.engine:   Render: 2095ms | TOTAL: 4701ms | Coverage: 75.8%
+INFO:     127.0.0.1:51625 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51712 - "GET /api/tiles/bdda6cb7.png HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64400 - "GET /api/tiles/bdda6cb7.png HTTP/1.1" 200 OK
