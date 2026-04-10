@@ -138,6 +138,20 @@ export const MapView = React.memo(function MapView({
     // Globe projection: shows the earth as a sphere when zoomed far out
     try { (map as any).setProjection?.({ type: 'globe' }); } catch (e) { /* not supported */ }
 
+    // Atmosphere / stars for globe view
+    map.on('style.load', () => {
+      try {
+        (map as any).setFog?.({
+          color: 'rgb(186, 210, 235)',
+          'high-color': 'rgb(36, 92, 223)',
+          'horizon-blend': 0.02,
+          'space-color': 'rgb(11, 11, 25)',
+          'star-intensity': 0.6,
+          range: [0.5, 10],
+        });
+      } catch (e) { /* fog not supported */ }
+    });
+
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
     map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
