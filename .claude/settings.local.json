@@ -20,7 +20,9 @@
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/franc/AppData/Local/Temp/restart_backend.ps1\")",
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/franc/AppData/Local/Temp/test_area.ps1\")",
       "Bash(powershell -Command \"Get-Content ''C:/Users/franc/OneDrive/Documents/GitHub/RF-analysis/backend/backend.log'' -Tail 20\")",
-      "Bash(\"C:/Users/franc/miniconda3/python.exe\" \"C:/Users/franc/AppData/Local/Temp/inspect3.py\")"
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" \"C:/Users/franc/AppData/Local/Temp/inspect3.py\")",
+      "Bash(python C:UsersfrancAppDataLocalTempradial.py)",
+      "Bash(python \"C:/Users/franc/AppData/Local/Temp/radial.py\")"
     ]
   }
 }
