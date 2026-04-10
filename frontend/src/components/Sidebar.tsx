@@ -52,6 +52,58 @@ function Field({ label, unit, children }: { label: string; unit?: string; childr
   );
 }
 
+/**
+ * NumberInput: controlled numeric field that lets the user clear the
+ * text and type intermediate states (e.g. "", "-", "1.") without the
+ * parent state snapping back to a fallback value. The committed numeric
+ * value is only set on a valid parse; invalid values are normalised on
+ * blur.
+ */
+interface NumberInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'type'> {
+  value: number;
+  onChange: (v: number) => void;
+  fallback?: number;
+}
+function NumberInput({ value, onChange, fallback = 0, ...rest }: NumberInputProps) {
+  const [text, setText] = React.useState<string>(() => String(value));
+
+  // If the upstream numeric value changes (e.g. dragged marker, preset
+  // loaded) AND the local text doesn't already parse to that value, sync
+  // the local text. This avoids clobbering the user's half-typed entry.
+  React.useEffect(() => {
+    const parsed = parseFloat(text);
+    if (Number.isNaN(parsed) || parsed !== value) {
+      setText(String(value));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  return (
+    <input
+      {...rest}
+      type="number"
+      value={text}
+      onChange={e => {
+        const next = e.target.value;
+        setText(next);
+        const n = parseFloat(next);
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      onBlur={e => {
+        const n = parseFloat(e.target.value);
+        if (Number.isNaN(n)) {
+          onChange(fallback);
+          setText(String(fallback));
+        } else {
+          // Normalise the displayed text to canonical form
+          setText(String(n));
+        }
+        rest.onBlur?.(e);
+      }}
+    />
+  );
+}
+
 export function Sidebar(props: SidebarProps) {
   const { isOpen, onToggle, activeTab, onTabChange, locale, loading, onRun } = props;
   const i = (key: any) => t(key, locale);
@@ -152,18 +204,21 @@ function TxPanel({ tx, setTx, i }: PanelProps) {
           <div className="label-text mb-2">{i('tx.coordinates')}</div>
           <div className="grid grid-cols-2 gap-3">
             <Field label={i('tx.latitude')} unit="D.D">
-              <input type="number" step="0.000001" className="input-field font-mono"
-                     value={tx.lat} onChange={e => setTx({ ...tx, lat: parseFloat(e.target.value) || 0 })} />
+              <NumberInput step="0.000001" className="input-field font-mono"
+                     value={tx.lat} fallback={0}
+                     onChange={v => setTx({ ...tx, lat: v })} />
             </Field>
             <Field label={i('tx.longitude')} unit="D.D">
-              <input type="number" step="0.000001" className="input-field font-mono"
-                     value={tx.lon} onChange={e => setTx({ ...tx, lon: parseFloat(e.target.value) || 0 })} />
+              <NumberInput step="0.000001" className="input-field font-mono"
+                     value={tx.lon} fallback={0}
+                     onChange={v => setTx({ ...tx, lon: v })} />
             </Field>
           </div>
         </div>
         <Field label={i('tx.height')} unit={i('tx.height_unit')}>
-          <input type="number" step="1" min="0.1" max="60000" className="input-field"
-                 value={tx.height} onChange={e => setTx({ ...tx, height: parseFloat(e.target.value) || 1 })} />
+          <NumberInput step="1" min="0.1" max="60000" className="input-field"
+                 value={tx.height} fallback={1}
+                 onChange={v => setTx({ ...tx, height: v })} />
         </Field>
       </div>
     </>

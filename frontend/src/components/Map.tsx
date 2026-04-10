@@ -17,69 +17,68 @@ interface MapProps {
   radius: number;
 }
 
-// Color legend stops - every 5 dB with distinct colors (matches backend)
+// Color legend stops - CloudRF-style rainbow (red=strong, blue=weak).
+// MUST stay in sync with backend engine.py COLOR_SCHEMAS.
 const COLOR_STOPS: Record<string, { label: string; stops: [number, string][] }> = {
   dBm: {
     label: 'dBm',
     stops: [
-      [-30, '#003c00'],   // Excellent
-      [-35, '#006400'],
-      [-40, '#008c00'],
-      [-45, '#00b400'],
-      [-50, '#00d200'],   // Very good
-      [-55, '#50dc00'],
-      [-60, '#a0e600'],   // Good
-      [-65, '#d2e600'],
-      [-70, '#ffe600'],   // Fair
-      [-75, '#ffc800'],
-      [-80, '#ffa500'],   // Weak
-      [-85, '#ff7800'],
-      [-90, '#ff5000'],   // Very weak
-      [-95, '#ff2800'],
-      [-100, '#e60000'],  // Marginal
-      [-105, '#c80028'],
-      [-110, '#aa0050'],  // Poor
-      [-115, '#8c0078'],
-      [-120, '#640088'],  // Very poor
-      [-125, '#460082'],
-      [-130, '#320064'],  // Near noise
+      [-30, '#ff1e1e'],   // Excellent - bright red
+      [-40, '#ff3c00'],
+      [-50, '#ff6e00'],   // Very good - red-orange
+      [-55, '#ff9600'],
+      [-60, '#ffbe00'],   // Good - amber
+      [-65, '#ffe100'],
+      [-70, '#dcf000'],   // Fair - yellow-green
+      [-75, '#aaf000'],
+      [-80, '#64e114'],   // Weak - green
+      [-85, '#1ec83c'],
+      [-90, '#00b478'],   // Very weak - teal-green
+      [-95, '#00a0b4'],
+      [-100, '#0082d2'],  // Marginal - cyan-blue
+      [-105, '#0a5adc'],
+      [-110, '#283cc8'],  // Poor - deep blue
+      [-115, '#461eaa'],
+      [-120, '#500a8c'],  // Very poor - violet
+      [-125, '#46006e'],
+      [-130, '#320050'],  // Near noise - dark purple
     ],
   },
   dB: {
     label: 'SNR (dB)',
     stops: [
-      [45, '#003c00'],
-      [40, '#007800'],
-      [35, '#00b400'],
-      [30, '#3cd200'],
-      [25, '#a0e600'],
-      [20, '#ffe600'],
-      [15, '#ffb400'],
-      [10, '#ff7800'],
-      [5, '#e62800'],
-      [0, '#b4003c'],
-      [-5, '#780078'],
-      [-10, '#3c0064'],
+      [45, '#ff1e1e'],
+      [40, '#ff5a00'],
+      [35, '#ff9600'],
+      [30, '#ffd200'],
+      [25, '#c8eb00'],
+      [20, '#78e114'],
+      [15, '#1ec850'],
+      [10, '#00aaaa'],
+      [5, '#0082d2'],
+      [0, '#283cc8'],
+      [-5, '#4614a0'],
+      [-10, '#320064'],
     ],
   },
   dBuV: {
     label: 'dBuV/m',
     stops: [
-      [60, '#003c00'],
-      [55, '#006400'],
-      [50, '#00b400'],
-      [45, '#50dc00'],
-      [40, '#a0e600'],
-      [35, '#ffe600'],
-      [30, '#ffc800'],
-      [25, '#ffa500'],
-      [20, '#ff7800'],
-      [15, '#ff5000'],
-      [10, '#e60000'],
-      [5, '#b4003c'],
-      [0, '#780078'],
-      [-5, '#460064'],
-      [-10, '#320050'],
+      [60, '#ff1e1e'],
+      [55, '#ff5a00'],
+      [50, '#ff9600'],
+      [45, '#ffd200'],
+      [40, '#c8eb00'],
+      [35, '#78e114'],
+      [30, '#1ec850'],
+      [25, '#00aaaa'],
+      [20, '#0082d2'],
+      [15, '#283cc8'],
+      [10, '#4614a0'],
+      [5, '#500a82'],
+      [0, '#46006e'],
+      [-5, '#320050'],
+      [-10, '#1e0032'],
     ],
   },
 };

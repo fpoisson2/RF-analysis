@@ -77,6 +77,8 @@ void diffraction_dominant_obstacle(
     const float lat_max,
     const float lon_min,
     const float lon_max,
+    const float* __restrict__ pixel_lats,  // (n_cells,) cell-center lats
+    const float* __restrict__ pixel_lons,  // (n_cells,) cell-center lons
     const float tx_lat,
     const float tx_lon,
     const float tx_ground,
@@ -85,7 +87,6 @@ void diffraction_dominant_obstacle(
     const float freq_mhz,
     const int   n_cells,
     const float radius_m,
-    const float cos_lat,
     float* __restrict__ diff_out)
 {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,14 +95,18 @@ void diffraction_dominant_obstacle(
 
     const size_t out_idx = (size_t)row * (size_t)n_cells + (size_t)col;
 
-    // Pixel geographic coordinates (cell center)
-    const float inv_cells = 1.0f / (float)n_cells;
-    const float pixel_lat = lat_max - ((float)row + 0.5f) * (lat_max - lat_min) * inv_cells;
-    const float pixel_lon = lon_min + ((float)col + 0.5f) * (lon_max - lon_min) * inv_cells;
+    // Pixel geographic coordinates (cell center) — host-provided so the
+    // kernel stays projection-agnostic (linear for small radii, Mercator
+    // Y spacing for large radii, etc.)
+    const float pixel_lat = pixel_lats[row];
+    const float pixel_lon = pixel_lons[col];
 
-    // Equirectangular ground distance TX -> pixel
+    // Equirectangular ground distance TX -> pixel using per-pixel cos_lat
+    // (midpoint rule). At 500 km radius the single-cos(tx_lat) approximation
+    // drifts ~9% in dx_m; the midpoint rule brings that back to <0.1%.
     const float dy_m = (pixel_lat - tx_lat) * 111320.0f;
-    const float dx_m = (pixel_lon - tx_lon) * 111320.0f * cos_lat;
+    const float mid_lat_rad = (pixel_lat + tx_lat) * 0.5f * 0.01745329252f;
+    const float dx_m = (pixel_lon - tx_lon) * 111320.0f * cosf(mid_lat_rad);
     const float dist_m = sqrtf(dx_m * dx_m + dy_m * dy_m);
 
     if (dist_m < 1.0f || dist_m > radius_m) {
@@ -326,10 +331,15 @@ def compute_diffraction_grid_gpu(
     freq_mhz: float,
     n_cells: int,
     radius_m: float,
-    cos_lat: float,
+    pixel_lats_1d: np.ndarray,
+    pixel_lons_1d: np.ndarray,
 ) -> np.ndarray:
     """
     Compute per-pixel knife-edge diffraction loss on GPU.
+
+    `pixel_lats_1d` and `pixel_lons_1d` are 1-D (n_cells,) arrays
+    holding the geographic coordinates of each row / column so the
+    kernel stays projection-agnostic.
 
     Returns a NumPy (n_cells, n_cells) float32 array of loss in dB.
     """
@@ -342,6 +352,8 @@ def compute_diffraction_grid_gpu(
 
     # Upload terrain to device (one-shot)
     elev_gpu = cp.asarray(elev_grid, dtype=cp.float32)
+    plat_gpu = cp.asarray(pixel_lats_1d, dtype=cp.float32)
+    plon_gpu = cp.asarray(pixel_lons_1d, dtype=cp.float32)
     diff_out = cp.zeros((n_cells, n_cells), dtype=cp.float32)
 
     # Block / grid dimensions (16x16 = 256 threads per block)
@@ -364,6 +376,8 @@ def compute_diffraction_grid_gpu(
             np.float32(lat_max),
             np.float32(lon_min),
             np.float32(lon_max),
+            plat_gpu,
+            plon_gpu,
             np.float32(tx_lat),
             np.float32(tx_lon),
             np.float32(tx_ground),
@@ -372,7 +386,6 @@ def compute_diffraction_grid_gpu(
             np.float32(freq_mhz),
             np.int32(n_cells),
             np.float32(radius_m),
-            np.float32(cos_lat),
             diff_out,
         ),
     )

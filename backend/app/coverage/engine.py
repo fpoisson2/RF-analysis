@@ -166,8 +166,18 @@ class CoverageEngine:
         tx_power_dbm = 10 * math.log10(power_w * 1000) if power_w > 0 else 0
 
         # Grid dimensions
-        n_cells = int(2 * radius_km * 1000 / resolution_m)
-        n_cells = max(10, min(n_cells, 2000))
+        # Honour the user's requested resolution even at large radii.
+        # The cap is deliberately generous (16 MP) so a 500 km radius
+        # at 250 m/px still fits. Only clamp if we'd otherwise blow past
+        # the compute budget.
+        requested_cells = int(2 * radius_km * 1000 / resolution_m)
+        MAX_CELLS = 4000  # 16 MP ceiling
+        n_cells = max(10, min(requested_cells, MAX_CELLS))
+        if requested_cells > MAX_CELLS:
+            logger.info(
+                f"  Requested {requested_cells}x{requested_cells} exceeds {MAX_CELLS}px cap; "
+                f"clamping (effective resolution = {2 * radius_km * 1000 / MAX_CELLS:.0f} m)"
+            )
         actual_resolution = 2 * radius_km * 1000 / n_cells
 
         cos_lat = math.cos(math.radians(tx_lat))
@@ -180,6 +190,12 @@ class CoverageEngine:
         lat_max = tx_lat + half_lat
         lon_min = tx_lon - half_lon
         lon_max = tx_lon + half_lon
+
+        # Large-radius flag: at >150 km, flat-earth and equirectangular
+        # pixel spacing start to introduce visible errors. We switch to
+        # Mercator Y pixel spacing and per-pixel cos_lat distance so the
+        # image overlay aligns correctly on the MapLibre map.
+        large_radius = radius_km > 150.0
 
         # Models
         prop_model = get_model(model_name)
@@ -209,10 +225,12 @@ class CoverageEngine:
         terrain_source = "SRTM"
 
         if hasattr(self.terrain, 'read_block'):
-            # Read at coverage resolution (no need for 1m here)
+            # Read at coverage resolution (no need for 1m here).
+            # Keep the terrain block slightly smaller than the output grid
+            # since terrain is only sampled along diffraction rays.
             terrain_res = max(actual_resolution, 5)  # At least 5m
             max_terrain_px = int(2 * radius_km * 1000 / terrain_res)
-            max_terrain_px = min(max_terrain_px, 2000)
+            max_terrain_px = min(max_terrain_px, 3000)
 
             mnt_block = self.terrain.read_block(
                 lat_min, lon_min, lat_max, lon_max,
@@ -288,18 +306,38 @@ class CoverageEngine:
         cols_idx = np.arange(n_cells)
         rr, cc = np.meshgrid(rows_idx, cols_idx, indexing='ij')
 
-        # Lat/lon of each pixel
-        pixel_lats = lat_max - rr * (lat_max - lat_min) / n_cells
-        pixel_lons = lon_min + cc * (lon_max - lon_min) / n_cells
+        # Lat/lon of each pixel.
+        # For large radii, use Mercator Y spacing so the rendered image
+        # overlay (which MapLibre draws in Web-Mercator) aligns with the
+        # actual ground coordinates. For small radii the difference is
+        # negligible so we keep the cheap linear interp.
+        pixel_lons = lon_min + (cc + 0.5) * (lon_max - lon_min) / n_cells
 
-        # Distance from TX in km
-        dlat_m = (pixel_lats - tx_lat) * 111320
-        dlon_m = (pixel_lons - tx_lon) * 111320 * cos_lat
-        dist_m = np.sqrt(dlat_m**2 + dlon_m**2)
+        if large_radius:
+            y_top = math.log(math.tan(math.pi / 4 + math.radians(lat_max) / 2))
+            y_bot = math.log(math.tan(math.pi / 4 + math.radians(lat_min) / 2))
+            row_frac = (rr.astype(np.float64) + 0.5) / n_cells
+            row_y = y_top + (y_bot - y_top) * row_frac  # row 0 = top
+            pixel_lats = np.degrees(2 * np.arctan(np.exp(row_y)) - math.pi / 2)
+        else:
+            pixel_lats = lat_max - (rr + 0.5) * (lat_max - lat_min) / n_cells
+
+        pixel_lats = pixel_lats.astype(np.float32)
+        pixel_lons = pixel_lons.astype(np.float32)
+
+        # Distance from TX in meters using per-pixel cos_lat (midpoint rule).
+        # The single-cos(tx_lat) approximation drifts up to 9% at 500 km,
+        # which both distorts the coverage disc shape and throws the path
+        # loss out by ~1 dB on the remote edges.
+        dlat_m = (pixel_lats - tx_lat) * 111320.0
+        mid_lat_rad = np.radians((pixel_lats + tx_lat) * 0.5)
+        cos_mid = np.cos(mid_lat_rad).astype(np.float32)
+        dlon_m = (pixel_lons - tx_lon) * 111320.0 * cos_mid
+        dist_m = np.sqrt(dlat_m ** 2 + dlon_m ** 2)
         dist_km = dist_m / 1000.0
         dist_km_clipped = np.maximum(dist_km, 0.001)
 
-        # Azimuth from TX (degrees)
+        # Azimuth from TX (degrees) — initial great-circle bearing
         az_grid = np.degrees(np.arctan2(dlon_m, dlat_m)) % 360
 
         # Circular mask
@@ -370,6 +408,10 @@ class CoverageEngine:
             tx_ground = float(sample_elevation(tx_lat, tx_lon))
             diff_backend = "CPU"
 
+            # Build 1-D lat/lon arrays at cell centers to pass to kernels
+            pixel_lats_1d = pixel_lats[:, 0].astype(np.float32)
+            pixel_lons_1d = pixel_lons[0, :].astype(np.float32)
+
             if GPU_AVAILABLE:
                 try:
                     diff_grid = compute_diffraction_grid_gpu(
@@ -377,7 +419,8 @@ class CoverageEngine:
                         lat_min, lat_max, lon_min, lon_max,
                         tx_lat, tx_lon, tx_ground, tx_h,
                         rx_h, freq,
-                        n_cells, radius_m_val, cos_lat,
+                        n_cells, radius_m_val,
+                        pixel_lats_1d, pixel_lons_1d,
                     )
                     diff_backend = "CUDA"
                 except Exception as e:
