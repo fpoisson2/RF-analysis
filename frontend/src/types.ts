@@ -23,6 +23,7 @@ export interface Antenna {
   h_beamwidth: number;
   v_beamwidth: number;
   pattern_type: string;
+  polarization: string;  // "V" (vertical), "H" (horizontal)
 }
 
 export interface Receiver {

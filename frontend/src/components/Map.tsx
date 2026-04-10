@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import { AreaResponse } from '../types';
 import { Locale, t } from '../i18n';
-import { Layers, Mountain, TreePine, Building2, X } from 'lucide-react';
+import { Layers, Mountain, TreePine, Building2, X, Box } from 'lucide-react';
 
 interface MapProps {
   onMapClick: (lat: number, lon: number) => void;
@@ -115,6 +115,8 @@ export const MapView = React.memo(function MapView({
   const onMapClickRef = useRef(onMapClick);
   const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const [loadingTerrain, setLoadingTerrain] = useState(false);
+  const [view3D, setView3D] = useState(false);
+  const [buildingsLoaded, setBuildingsLoaded] = useState(false);
 
   onMapClickRef.current = onMapClick;
 
@@ -130,7 +132,11 @@ export const MapView = React.memo(function MapView({
       center: txPosition,
       zoom: 11,
       attributionControl: false,
+      maxPitch: 85,
     });
+
+    // Globe projection: shows the earth as a sphere when zoomed far out
+    try { (map as any).setProjection?.({ type: 'globe' }); } catch (e) { /* not supported */ }
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
@@ -159,7 +165,58 @@ export const MapView = React.memo(function MapView({
     markerRef.current = marker;
     mapRef.current = map;
 
+    // --- Middle-mouse-button drag = rotate + pitch (3D navigation) -----
+    // MapLibre's default dragRotate only uses right-click/ctrl-left; we
+    // add middle-click (button 1) as an additional rotate/pitch gesture
+    // so users can fly around the 3D scene without needing modifier keys.
+    const canvas = map.getCanvas();
+    let midDrag = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    const onMidDown = (e: MouseEvent) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      midDrag = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      canvas.style.cursor = 'grabbing';
+      // Disable default click-pan while middle drag is active
+      map.dragPan.disable();
+    };
+    const onMidMove = (e: MouseEvent) => {
+      if (!midDrag) return;
+      e.preventDefault();
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+
+      const bearing = map.getBearing() + dx * 0.5;     // drag right = rotate clockwise
+      const pitch = Math.max(0, Math.min(85, map.getPitch() - dy * 0.5));  // drag up = tilt more
+      map.jumpTo({ bearing, pitch });
+    };
+    const onMidUp = (e: MouseEvent) => {
+      if (e.button !== 1 || !midDrag) return;
+      midDrag = false;
+      canvas.style.cursor = '';
+      map.dragPan.enable();
+    };
+    // Kill the browser's middle-click auto-scroll
+    const onMidDownPrevent = (e: MouseEvent) => {
+      if (e.button === 1) e.preventDefault();
+    };
+
+    canvas.addEventListener('mousedown', onMidDown);
+    canvas.addEventListener('auxclick', onMidDownPrevent);
+    window.addEventListener('mousemove', onMidMove);
+    window.addEventListener('mouseup', onMidUp);
+
     return () => {
+      canvas.removeEventListener('mousedown', onMidDown);
+      canvas.removeEventListener('auxclick', onMidDownPrevent);
+      window.removeEventListener('mousemove', onMidMove);
+      window.removeEventListener('mouseup', onMidUp);
       marker.remove();
       map.remove();
       markerRef.current = null;
@@ -255,6 +312,150 @@ export const MapView = React.memo(function MapView({
       .finally(() => setLoadingTerrain(false));
   }, [terrainLayer, txPosition[0], txPosition[1], radius]);
 
+  // 3D view: toggle pitch + fill-extrusion buildings layer
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const removeBuildings = () => {
+      if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
+      if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
+    };
+
+    if (!view3D) {
+      if (map.isStyleLoaded()) {
+        removeBuildings();
+        // Remove 3D terrain
+        try { (map as any).setTerrain?.(null); } catch (e) { /* ignore */ }
+        if (map.getSource('terrain-dem')) map.removeSource('terrain-dem');
+      }
+      map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
+      setBuildingsLoaded(false);
+      return;
+    }
+
+    // Enable 3D: tilt the camera and fetch buildings around the TX
+    map.easeTo({ pitch: 60, bearing: -20, duration: 800 });
+
+    // 3D terrain via free AWS/Mapzen DEM tiles
+    const addTerrain = () => {
+      try {
+        if (!map.getSource('terrain-dem')) {
+          map.addSource('terrain-dem', {
+            type: 'raster-dem',
+            tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            encoding: 'terrarium',
+            maxzoom: 15,
+          });
+        }
+        (map as any).setTerrain?.({ source: 'terrain-dem', exaggeration: 1.5 });
+      } catch (e) {
+        console.warn('3D terrain not supported:', e);
+      }
+    };
+    if (map.isStyleLoaded()) addTerrain();
+    else map.once('load', addTerrain);
+
+    const lat = txPosition[1];
+    const lon = txPosition[0];
+    // Fetch buildings for a generous area around TX.
+    // The backend caps the number of features so very large radii
+    // won't blow up the browser.
+    const buildingsRadius = Math.min(Math.max(radius, 1), 15);
+
+    fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(async (data) => {
+        if (!data || !map || !data.features) return;
+
+        // Prepare building features with height
+        const features = data.features
+          .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
+          .map((f: any) => {
+            const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
+            // Compute centroid from first ring
+            const ring = f.geometry.type === 'Polygon'
+              ? f.geometry.coordinates[0]
+              : f.geometry.coordinates[0][0];
+            const cLat = ring.reduce((s: number, p: number[]) => s + p[1], 0) / ring.length;
+            const cLon = ring.reduce((s: number, p: number[]) => s + p[0], 0) / ring.length;
+            return {
+              ...f,
+              properties: { ...f.properties, height: h, centroid_lat: cLat, centroid_lon: cLon },
+            };
+          });
+
+        // Batch-query the coverage engine for rooftop signal values
+        try {
+          const buildingsIn = features.map((f: any) => ({
+            lat: f.properties.centroid_lat,
+            lon: f.properties.centroid_lon,
+            height: f.properties.height,
+          }));
+          const sigResp = await fetch('/api/coverage/buildings3d', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ buildings: buildingsIn }),
+          });
+          if (sigResp.ok) {
+            const sigData = await sigResp.json();
+            const results = sigData.results || [];
+            for (let i = 0; i < features.length && i < results.length; i++) {
+              features[i].properties.signal_roof = results[i].signal_roof;
+              features[i].properties.signal_street = results[i].signal_street;
+              features[i].properties.delta_db = results[i].delta_db;
+            }
+          }
+        } catch (e) {
+          // Not fatal — buildings just won't have signal colors
+          console.warn('buildings3d signal query failed', e);
+        }
+
+        const add = () => {
+          removeBuildings();
+          map.addSource('buildings-3d-source', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features },
+          });
+
+          // Color buildings by rooftop signal: red=strong, blue=weak, gray=no data
+          map.addLayer({
+            id: 'buildings-3d',
+            type: 'fill-extrusion',
+            source: 'buildings-3d-source',
+            paint: {
+              'fill-extrusion-color': [
+                'case',
+                ['has', 'signal_roof'],
+                [
+                  'interpolate', ['linear'], ['get', 'signal_roof'],
+                  -120, '#461eaa',  // weak - violet
+                  -100, '#0082d2',  // marginal - cyan-blue
+                  -90,  '#00b478',  // teal-green
+                  -80,  '#64e114',  // green
+                  -70,  '#dcf000',  // yellow-green
+                  -60,  '#ffbe00',  // amber
+                  -50,  '#ff6e00',  // orange
+                  -30,  '#ff1e1e',  // strong - red
+                ],
+                '#9ca3af',  // no coverage data - gray
+              ],
+              'fill-extrusion-height': ['get', 'height'],
+              'fill-extrusion-base': 0,
+              'fill-extrusion-opacity': 0.85,
+            },
+          });
+          setBuildingsLoaded(true);
+        };
+
+        if (map.isStyleLoaded()) add();
+        else map.once('load', add);
+      })
+      .catch(console.error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view3D, txPosition[0], txPosition[1], radius]);
+
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
   const fr = locale === 'fr';
 
@@ -272,6 +473,15 @@ export const MapView = React.memo(function MapView({
           title={fr ? 'Couches de données' : 'Data layers'}
         >
           <Layers className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setView3D(!view3D)}
+          className={`p-2 rounded-lg shadow-lg border transition-colors ${
+            view3D ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface-2/90 border-gray-700/50 text-gray-300 hover:bg-surface-3'
+          }`}
+          title={fr ? 'Vue 3D (bâtiments + signal)' : '3D view (buildings + signal)'}
+        >
+          <Box className="w-4 h-4" />
         </button>
 
         {layerMenuOpen && (

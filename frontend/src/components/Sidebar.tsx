@@ -278,7 +278,8 @@ function SignalPanel({ signal, setSignal, feeder, setFeeder, erp_w, erp_dbm, eir
   );
 }
 
-function AntennaPanel({ antenna, setAntenna, i }: PanelProps) {
+function AntennaPanel({ antenna, setAntenna, i, locale }: PanelProps) {
+  const fr = locale === 'fr';
   return (
     <>
       <h3 className="section-title">{i('ant.title')}</h3>
@@ -297,6 +298,13 @@ function AntennaPanel({ antenna, setAntenna, i }: PanelProps) {
           <NumberInput step="0.1" min="-30" max="50" className="input-field"
                  value={antenna.gain} fallback={0}
                  onChange={v => setAntenna({ ...antenna, gain: v })} />
+        </Field>
+        <Field label={fr ? 'Polarisation' : 'Polarization'}>
+          <select className="select-field" value={antenna.polarization || 'V'}
+                  onChange={e => setAntenna({ ...antenna, polarization: e.target.value })}>
+            <option value="V">{fr ? 'Verticale (V)' : 'Vertical (V)'}</option>
+            <option value="H">{fr ? 'Horizontale (H)' : 'Horizontal (H)'}</option>
+          </select>
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label={i('ant.azimuth')} unit="deg">

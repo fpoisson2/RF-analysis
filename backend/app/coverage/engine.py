@@ -108,6 +108,12 @@ class CoverageEngine:
 
     def __init__(self, terrain_manager):
         self.terrain = terrain_manager
+        # Cache the last computed signal grid so we can sample per-building
+        # rooftop signals without a full recompute
+        self._last_grid = None      # (n, n) float32
+        self._last_bounds = None    # (lat_min, lat_max, lon_min, lon_max)
+        self._last_tx_h = None
+        self._last_freq = None
         if GPU_AVAILABLE:
             logger.info("CoverageEngine: GPU acceleration ENABLED")
         else:
@@ -166,12 +172,20 @@ class CoverageEngine:
         tx_power_dbm = 10 * math.log10(power_w * 1000) if power_w > 0 else 0
 
         # Grid dimensions
-        # Honour the user's requested resolution even at large radii.
-        # The cap is deliberately generous (16 MP) so a 500 km radius
-        # at 250 m/px still fits. Only clamp if we'd otherwise blow past
-        # the compute budget.
+        # Honour the user's requested resolution up to a generous ceiling.
+        # Why a cap at all?
+        #   * The per-pixel CUDA kernel traces up to 1024 ray samples and
+        #     does 3 Deygout passes, so each pixel is ~3k FLOPs. At 8000²
+        #     (64 MP) that's ~200 billion ops, ~30-40 s on an RTX 5070 Ti.
+        #   * The PNG render + base64 + HTTP transport adds another few
+        #     seconds at that size.
+        #   * The terrain block load is currently capped at 3000² so
+        #     going much higher just oversamples the same terrain data.
+        # 8000² (64 MP) is the practical ceiling before the request times
+        # out for most users; bumping it higher would require tiled
+        # rendering.
         requested_cells = int(2 * radius_km * 1000 / resolution_m)
-        MAX_CELLS = 4000  # 16 MP ceiling
+        MAX_CELLS = 8000  # 64 MP ceiling
         n_cells = max(10, min(requested_cells, MAX_CELLS))
         if requested_cells > MAX_CELLS:
             logger.info(
@@ -351,10 +365,39 @@ class CoverageEngine:
         )
         base_path_loss = np.asarray(base_path_loss, dtype=np.float32)
 
-        # Vectorized antenna gain (fancy-indexed lookup, ~250x faster than list comp)
-        pattern_slice = np.asarray(pattern[:360, 90], dtype=np.float32)  # (360,) az slice at 0° elev
-        az_idx = (az_grid.astype(np.int32) % 360)
-        ant_gains = pattern_slice[az_idx]
+        # ── Vectorized 2D antenna gain with tilt + elevation angle ─────
+        # The previous code used a 1D azimuth slice at 0° elevation,
+        # ignoring tilt and the actual elevation angle from TX to pixel.
+        # This missed the dipole nulls directly below and the effect of
+        # sector downtilt entirely.
+        #
+        # Elevation angle from TX to each pixel:
+        #   tan(el) = Δh / d_horiz
+        # where Δh = (tx_ground + tx_h) - (rx_ground + rx_h).
+        tx_ground_elev = float(sample_elevation(tx_lat, tx_lon))
+        # Sample RX ground elevation from terrain grid
+        rx_r = np.clip(
+            ((lat_max - pixel_lats) / max(lat_max - lat_min, 1e-9) * (terrain_h - 1)).astype(np.int32),
+            0, terrain_h - 1,
+        )
+        rx_c = np.clip(
+            ((pixel_lons - lon_min) / max(lon_max - lon_min, 1e-9) * (terrain_w - 1)).astype(np.int32),
+            0, terrain_w - 1,
+        )
+        rx_ground_elev = elev_grid[rx_r, rx_c].astype(np.float32)
+
+        dh = (tx_ground_elev + tx_h) - (rx_ground_elev + rx_h)
+        elev_angle = np.degrees(np.arctan2(dh, np.maximum(dist_m, 1.0))).astype(np.float32)
+
+        # Relative azimuth and elevation (adjusted for antenna orientation + tilt)
+        rel_az = (az_grid - ant_azimuth + 360) % 360
+        rel_el = elev_angle + ant_tilt   # positive tilt = downtilt toward ground
+
+        # 2D pattern lookup (360 x 181)
+        az_idx = (rel_az.astype(np.int32) % 360)
+        el_idx = np.clip((rel_el + 90).astype(np.int32), 0, 180)
+        pattern_f = np.asarray(pattern[:360, :181], dtype=np.float32)
+        ant_gains = pattern_f[az_idx, el_idx]
 
         # Base link budget (vectorized)
         rx_power = tx_power_dbm - feeder_loss + ant_gains - base_path_loss + rx_gain
@@ -480,6 +523,12 @@ class CoverageEngine:
 
         logger.info(f"  Render: {t_render:.0f}ms | TOTAL: {elapsed:.0f}ms | Coverage: {coverage_pct:.1f}%")
 
+        # Cache the raw grid for per-building rooftop sampling
+        self._last_grid = grid.copy()
+        self._last_bounds = (lat_min, lat_max, lon_min, lon_max)
+        self._last_tx_h = tx_h
+        self._last_freq = freq
+
         bounds = {
             "north": lat_max, "south": lat_min,
             "east": lon_max, "west": lon_min,
@@ -512,6 +561,60 @@ class CoverageEngine:
             "eirp_w": round(eirp_w, 4),
             "eirp_dbm": round(eirp_dbm, 1),
         }
+
+    def sample_buildings(self, buildings: list) -> list:
+        """
+        Sample the last coverage grid at building centroids to obtain
+        *street-level* and *rooftop* signal estimates.
+
+        Each building dict MUST contain:
+          lat, lon, height   (height in meters, 0 for ground)
+
+        Returns a list of dicts with:
+          signal_street : signal at 1.5 m above ground (from cached grid)
+          signal_roof   : approximate signal at the building rooftop
+          delta_db      : rooftop improvement over street level
+
+        The rooftop value is a Hata-style approximation:
+          Δ ≈ 6 · log₂(h / 1.5) clipped to [0, 25]
+        This is free (no recompute) and close enough for visualisation.
+        """
+        if self._last_grid is None or self._last_bounds is None:
+            return [{"signal_street": None, "signal_roof": None, "delta_db": 0}
+                    for _ in buildings]
+
+        grid = self._last_grid
+        gh, gw = grid.shape
+        lat_min, lat_max, lon_min, lon_max = self._last_bounds
+        dlat = lat_max - lat_min
+        dlon = lon_max - lon_min
+
+        results = []
+        for b in buildings:
+            blat = b.get("lat", 0)
+            blon = b.get("lon", 0)
+            bh = max(float(b.get("height", 0)), 1.5)
+
+            # Map to grid
+            r = int((lat_max - blat) / dlat * (gh - 1))
+            c = int((blon - lon_min) / dlon * (gw - 1))
+            r = max(0, min(gh - 1, r))
+            c = max(0, min(gw - 1, c))
+            street = float(grid[r, c])
+            if np.isnan(street):
+                results.append({"signal_street": None, "signal_roof": None, "delta_db": 0})
+                continue
+
+            # Hata-style height correction
+            delta = 6.0 * math.log2(max(bh, 1.5) / 1.5) if bh > 1.5 else 0.0
+            delta = min(delta, 25.0)
+
+            results.append({
+                "signal_street": round(street, 1),
+                "signal_roof": round(street + delta, 1),
+                "delta_db": round(delta, 1),
+            })
+        return results
 
     def calculate_path(self, params: dict) -> dict:
         """Calculate point-to-point path profile."""

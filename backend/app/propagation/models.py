@@ -37,11 +37,22 @@ def _wavelength(freq_mhz: float) -> float:
 def free_space(d_km, freq_mhz, tx_h=None, rx_h=None, **kw):
     """
     Free space path loss (Friis equation).
-    FSPL = 32.44 + 20*log10(f_MHz) + 20*log10(d_km)
-    Valid: all frequencies, reference model.
+    FSPL = 32.44 + 20*log10(f_MHz) + 20*log10(d_slant_km)
+
+    Uses 3-D slant distance when antenna heights are provided so that
+    extreme heights (e.g. 10 000 m) correctly increase FSPL.  The signal
+    must physically travel the full slant path, not just the horizontal
+    projection.  Empirical models (Hata, Egli, …) handle height through
+    their own formulas and still receive horizontal distance.
     """
     d_km = np.maximum(np.asarray(d_km, dtype=float), 0.001)
-    return 32.44 + 20.0 * np.log10(freq_mhz) + 20.0 * np.log10(d_km)
+    # 3-D slant distance
+    if tx_h is not None and rx_h is not None:
+        dh_km = abs(float(tx_h) - float(rx_h)) / 1000.0
+        d_slant = np.sqrt(d_km ** 2 + dh_km ** 2)
+    else:
+        d_slant = d_km
+    return 32.44 + 20.0 * np.log10(freq_mhz) + 20.0 * np.log10(d_slant)
 
 
 # ══════════════════════════════════════════════════════════════════════

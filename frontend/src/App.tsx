@@ -13,7 +13,7 @@ import { Radio, Sun, Moon, HelpCircle, Zap, Globe } from 'lucide-react';
 const DEFAULT_TX: Transmitter = { lat: 46.83035, lon: -71.227008, height: 30, name: 'Site', network: 'Mon Réseau' };
 const DEFAULT_SIGNAL: Signal = { frequency: 155, power: 5, bandwidth: 0.25 };
 const DEFAULT_FEEDER: Feeder = { loss: 3 };
-const DEFAULT_ANTENNA: Antenna = { gain: 2.15, azimuth: 0, tilt: 0, h_beamwidth: 360, v_beamwidth: 90, pattern_type: 'dipole' };
+const DEFAULT_ANTENNA: Antenna = { gain: 2.15, azimuth: 0, tilt: 0, h_beamwidth: 360, v_beamwidth: 90, pattern_type: 'dipole', polarization: 'V' };
 const DEFAULT_RX: Receiver = { lat: null, lon: null, height: 1.5, gain: 2, sensitivity: -90 };
 const DEFAULT_MODEL: PropagationModel = { name: 'itm', reliability: 50, diffraction: 'deygout94' };
 const DEFAULT_ENV: Environment = { elevation_model: 'dtm', noise_floor: -100 };

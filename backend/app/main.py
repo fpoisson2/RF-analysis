@@ -120,6 +120,22 @@ def path_profile(req: PathRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/coverage/buildings3d")
+def buildings_3d(data: dict):
+    """
+    Sample the latest coverage grid at building centroids and estimate
+    rooftop vs street signal for 3D visualisation.
+
+    Body: { "buildings": [ {"lat": ..., "lon": ..., "height": ...}, ... ] }
+    Returns per-building signal_street, signal_roof, delta_db.
+    """
+    buildings = data.get("buildings", [])
+    if not buildings:
+        return {"results": []}
+    results = engine.sample_buildings(buildings)
+    return {"results": results}
+
+
 @app.get("/api/tiles/{filename}")
 def get_tile(filename: str):
     """Serve generated heatmap tiles."""
@@ -338,7 +354,9 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
 
     filtered = []
     for feature in data.get("features", []):
-        geom = feature.get("geometry", {})
+        geom = feature.get("geometry")
+        if geom is None:
+            continue
         coords = geom.get("coordinates", [])
 
         # Get centroid
@@ -378,6 +396,6 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
 
     return {
         "type": "FeatureCollection",
-        "features": filtered[:5000],  # Limit for performance
+        "features": filtered[:10000],  # Limit for performance
         "total_in_area": len(filtered),
     }
