@@ -7,7 +7,20 @@
       "Bash(python -c \":*)",
       "Bash(curl -s http://localhost:8000/api/health)",
       "Bash(powershell -Command \":*)",
-      "Bash(python -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\(''''backend up | gpu:'''', d[''''gpu''''][''''device'''']\\)\")"
+      "Bash(python -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\(''''backend up | gpu:'''', d[''''gpu''''][''''device'''']\\)\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/franc/AppData/Local/Temp/lsdata.ps1\")",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" -c \"import rasterio; from rasterio.features import rasterize; print\\(''rasterio OK'', rasterio.__version__\\)\")",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" -c \":*)",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" \"C:/Users/franc/AppData/Local/Temp/probe_geojson.py\")",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" \"C:/Users/franc/AppData/Local/Temp/probe_mhc.py\")",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" -c \"import ast, io; ast.parse\\(io.open\\(''C:/Users/franc/OneDrive/Documents/GitHub/RF-analysis/backend/app/coverage/engine.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(powershell -Command \"Get-CimInstance Win32_Process -Filter \"\"Name=''python.exe''\"\" | Select-Object ProcessId, CommandLine | Format-Table -Wrap\")",
+      "Bash(powershell -Command \"Stop-Process -Id 19672 -Force; Start-Sleep -Milliseconds 500\")",
+      "Bash(powershell -Command \"Get-CimInstance Win32_Process -Filter \"\"Name=''python.exe''\"\" | Select-Object ProcessId | ForEach-Object { Stop-Process -Id $_ProcessId -Force }; Start-Sleep -Milliseconds 500\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/franc/AppData/Local/Temp/restart_backend.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/franc/AppData/Local/Temp/test_area.ps1\")",
+      "Bash(powershell -Command \"Get-Content ''C:/Users/franc/OneDrive/Documents/GitHub/RF-analysis/backend/backend.log'' -Tail 20\")",
+      "Bash(\"C:/Users/franc/miniconda3/python.exe\" \"C:/Users/franc/AppData/Local/Temp/inspect3.py\")"
     ]
   }
 }

@@ -29,70 +29,71 @@ logger = logging.getLogger(__name__)
 # Color schemas (5 dB steps)
 # ═══════════════════════════════════════════════════════════════
 
+# Rainbow palette inspired by CloudRF: RED = strong, GREEN = medium,
+# BLUE = weak. The previous palette mapped the strongest signals to dark
+# green which made the transmitter centre look like a shadow spot.
 COLOR_SCHEMAS = {
     "signal_strength": {
         "name": "Signal Strength (dBm)",
         "unit": "dBm",
         "stops": [
-            (-30, (0, 60, 0, 230)),
-            (-35, (0, 100, 0, 225)),
-            (-40, (0, 140, 0, 220)),
-            (-45, (0, 180, 0, 215)),
-            (-50, (0, 210, 0, 210)),
-            (-55, (80, 220, 0, 205)),
-            (-60, (160, 230, 0, 200)),
-            (-65, (210, 230, 0, 200)),
-            (-70, (255, 230, 0, 195)),
-            (-75, (255, 200, 0, 190)),
-            (-80, (255, 165, 0, 185)),
-            (-85, (255, 120, 0, 180)),
-            (-90, (255, 80, 0, 175)),
-            (-95, (255, 40, 0, 170)),
-            (-100, (230, 0, 0, 165)),
-            (-105, (200, 0, 40, 155)),
-            (-110, (170, 0, 80, 150)),
-            (-115, (140, 0, 120, 140)),
-            (-120, (100, 0, 140, 130)),
-            (-125, (70, 0, 130, 110)),
-            (-130, (50, 0, 100, 90)),
+            (-30, (255,  30,  30, 235)),  # bright red - excellent
+            (-40, (255,  60,   0, 230)),  # red
+            (-50, (255, 110,   0, 225)),  # red-orange
+            (-55, (255, 150,   0, 220)),  # orange
+            (-60, (255, 190,   0, 215)),  # amber
+            (-65, (255, 225,   0, 210)),  # yellow
+            (-70, (220, 240,   0, 205)),  # yellow-green
+            (-75, (170, 240,   0, 200)),  # lime
+            (-80, (100, 225,  20, 195)),  # green
+            (-85, ( 30, 200,  60, 190)),  # forest green
+            (-90, (  0, 180, 120, 180)),  # teal-green
+            (-95, (  0, 160, 180, 170)),  # teal
+            (-100, (  0, 130, 210, 160)), # cyan-blue
+            (-105, ( 10,  90, 220, 150)), # blue
+            (-110, ( 40,  60, 200, 135)), # deep blue
+            (-115, ( 70,  30, 170, 120)), # indigo
+            (-120, ( 80,  10, 140, 105)), # violet
+            (-125, ( 70,   0, 110,  90)), # purple
+            (-130, ( 50,   0,  80,  75)), # dark purple - noise floor
         ],
     },
     "snr": {
         "name": "Signal to Noise Ratio (dB)",
         "unit": "dB",
         "stops": [
-            (45, (0, 60, 0, 230)),
-            (40, (0, 120, 0, 220)),
-            (35, (0, 180, 0, 210)),
-            (30, (60, 210, 0, 205)),
-            (25, (160, 230, 0, 200)),
-            (20, (255, 230, 0, 195)),
-            (15, (255, 180, 0, 185)),
-            (10, (255, 120, 0, 175)),
-            (5, (230, 40, 0, 165)),
-            (0, (180, 0, 60, 150)),
-            (-5, (120, 0, 120, 130)),
-            (-10, (60, 0, 100, 100)),
+            (45, (255,  30,  30, 235)),
+            (40, (255,  90,   0, 225)),
+            (35, (255, 150,   0, 220)),
+            (30, (255, 210,   0, 210)),
+            (25, (200, 235,   0, 205)),
+            (20, (120, 225,  20, 200)),
+            (15, ( 30, 200,  80, 190)),
+            (10, (  0, 170, 170, 180)),
+            ( 5, (  0, 130, 210, 165)),
+            ( 0, ( 40,  60, 200, 140)),
+            (-5, ( 70,  20, 160, 120)),
+            (-10, (50,   0, 100, 100)),
         ],
     },
     "path_loss": {
         "name": "Path Loss (dB)",
         "unit": "dB",
         "stops": [
-            (50, (0, 60, 0, 230)),
-            (60, (0, 140, 0, 220)),
-            (70, (0, 210, 0, 210)),
-            (80, (120, 230, 0, 200)),
-            (90, (230, 230, 0, 195)),
-            (100, (255, 190, 0, 185)),
-            (110, (255, 140, 0, 180)),
-            (120, (255, 80, 0, 170)),
-            (130, (240, 20, 0, 160)),
-            (140, (200, 0, 50, 150)),
-            (150, (160, 0, 100, 140)),
-            (160, (120, 0, 130, 130)),
-            (170, (80, 0, 120, 110)),
-            (180, (50, 0, 90, 90)),
+            ( 50, (255,  30,  30, 235)),
+            ( 60, (255,  90,   0, 225)),
+            ( 70, (255, 150,   0, 220)),
+            ( 80, (255, 210,   0, 210)),
+            ( 90, (200, 235,   0, 200)),
+            (100, (100, 225,  20, 195)),
+            (110, ( 30, 200,  80, 190)),
+            (120, (  0, 170, 170, 180)),
+            (130, (  0, 130, 210, 165)),
+            (140, ( 40,  60, 200, 150)),
+            (150, ( 70,  20, 160, 130)),
+            (160, ( 80,   0, 130, 110)),
+            (170, ( 60,   0, 100,  90)),
+            (180, ( 40,   0,  70,  75)),
         ],
     },
 }
@@ -150,10 +151,12 @@ class CoverageEngine:
         model_name = mdl["name"]
         diffraction_name = mdl.get("diffraction", "deygout94")
         reliability = mdl.get("reliability", 50)
+        context = mdl.get("context", env.get("context", "average"))  # conservative / average / optimistic
         noise_floor = env.get("noise_floor", -100)
         units = out.get("units", "dBm")
         color_schema = out.get("color_schema", "signal_strength")
         use_canopy = env.get("elevation_model", "dtm") == "dsm"
+        clutter_preset = env.get("clutter", "suburban")  # rural / suburban / urban / dense_urban
 
         # ERP / EIRP
         erp_w = power_w * 10 ** ((ant_gain_dbi - 2.15 - feeder_loss) / 10)
@@ -194,10 +197,16 @@ class CoverageEngine:
         # ── Step 1: Pre-load terrain grid in one shot ─────────────
         t1 = time.time()
 
-        # Try LiDAR block read first (fast, high-res)
-        elev_grid = None
+        # Read MNT (bare earth) and MHC (canopy + buildings) together.
+        # MHC on MERN Québec data is derived from LiDAR first-returns so
+        # it includes BOTH tree canopy AND building roofs. We always
+        # fold MHC into the terrain used for diffraction so urban areas
+        # get realistic knife-edge shadowing - matching CloudRF's DSM
+        # behaviour. The UI DTM/DSM toggle only affects display layers.
+        elev_grid = None       # Surface used for diffraction (MNT+MHC)
+        base_grid = None       # Bare earth MNT for antenna mounting
+        mhc_grid = None        # Canopy/buildings delta (for 3D display)
         terrain_source = "SRTM"
-        ds_type = "mhc" if use_canopy else "mnt"
 
         if hasattr(self.terrain, 'read_block'):
             # Read at coverage resolution (no need for 1m here)
@@ -205,43 +214,53 @@ class CoverageEngine:
             max_terrain_px = int(2 * radius_km * 1000 / terrain_res)
             max_terrain_px = min(max_terrain_px, 2000)
 
-            block = self.terrain.read_block(
+            mnt_block = self.terrain.read_block(
                 lat_min, lon_min, lat_max, lon_max,
-                dataset_type=ds_type, max_pixels=max_terrain_px
+                dataset_type="mnt", max_pixels=max_terrain_px,
             )
-            if block is not None:
-                elev_grid = block[0]
+            if mnt_block is not None:
+                base_grid = np.nan_to_num(mnt_block[0], nan=0.0).astype(np.float32, copy=False)
                 terrain_source = "LiDAR"
 
-                # If using canopy mode but read MHC, we need terrain + canopy
-                if use_canopy:
-                    mnt_block = self.terrain.read_block(
-                        lat_min, lon_min, lat_max, lon_max,
-                        dataset_type="mnt", max_pixels=max_terrain_px
-                    )
-                    if mnt_block is not None:
-                        mnt_data = mnt_block[0]
-                        if mnt_data.shape == elev_grid.shape:
-                            elev_grid = mnt_data + np.maximum(elev_grid, 0)
-                        else:
-                            # Just use MNT if shapes don't match
-                            elev_grid = mnt_data
+                # Try to also read MHC (canopy + buildings) at same shape
+                mhc_block = self.terrain.read_block(
+                    lat_min, lon_min, lat_max, lon_max,
+                    dataset_type="mhc", max_pixels=max_terrain_px,
+                )
+                if mhc_block is not None and mhc_block[0].shape == base_grid.shape:
+                    mhc_grid = np.nan_to_num(mhc_block[0], nan=0.0).astype(np.float32, copy=False)
+                    mhc_grid = np.maximum(mhc_grid, 0.0)  # negative = noise
+                    elev_grid = base_grid + mhc_grid
+                else:
+                    elev_grid = base_grid
 
-        # Fallback to point-by-point if no block read
+        # Fallback to point-by-point if no block read (no LiDAR)
         if elev_grid is None:
             terrain_n = min(500, n_cells)
-            elev_grid = np.zeros((terrain_n, terrain_n), dtype=np.float32)
+            base_grid = np.zeros((terrain_n, terrain_n), dtype=np.float32)
             t_lats = np.linspace(lat_max, lat_min, terrain_n)
             t_lons = np.linspace(lon_min, lon_max, terrain_n)
             for r in range(terrain_n):
                 for c in range(terrain_n):
-                    elev_grid[r, c] = self.terrain.get_elevation(t_lats[r], t_lons[c])
+                    base_grid[r, c] = self.terrain.get_elevation(t_lats[r], t_lons[c])
+            base_grid = np.nan_to_num(base_grid, nan=0.0)
+            elev_grid = base_grid
 
-        elev_grid = np.nan_to_num(elev_grid, nan=0.0)
         terrain_h, terrain_w = elev_grid.shape
 
+        # When the user explicitly wants a bare-earth simulation
+        # (use_canopy=False), they still get MHC in the diffraction path
+        # because that's what matches reality. But if they explicitly
+        # ask for DTM-only sim we honor that by clearing mhc_grid.
+        # (Most CloudRF-style tools don't offer this choice at all.)
+        has_clutter_layer = mhc_grid is not None
+
         t_terrain = (time.time() - t1) * 1000
-        logger.info(f"Coverage: {n_cells}x{n_cells} @ {actual_resolution:.0f}m | Terrain: {terrain_w}x{terrain_h} [{terrain_source}] {t_terrain:.0f}ms")
+        logger.info(
+            f"Coverage: {n_cells}x{n_cells} @ {actual_resolution:.0f}m | "
+            f"Terrain: {terrain_w}x{terrain_h} [{terrain_source}] "
+            f"{'+MHC clutter ' if has_clutter_layer else ''}{t_terrain:.0f}ms"
+        )
 
         # ── Helper: sample terrain from pre-loaded grid ───────────
         def sample_elevation(lat, lon):
@@ -288,7 +307,10 @@ class CoverageEngine:
         circle_mask = dist_m <= radius_m_val
 
         # Vectorized propagation (no terrain profile - base loss)
-        base_path_loss = prop_model(dist_km_clipped, freq, tx_h, rx_h, reliability=reliability)
+        base_path_loss = prop_model(
+            dist_km_clipped, freq, tx_h, rx_h,
+            reliability=reliability, context=context,
+        )
         base_path_loss = np.asarray(base_path_loss, dtype=np.float32)
 
         # Vectorized antenna gain (fancy-indexed lookup, ~250x faster than list comp)
@@ -298,6 +320,45 @@ class CoverageEngine:
 
         # Base link budget (vectorized)
         rx_power = tx_power_dbm - feeder_loss + ant_gains - base_path_loss + rx_gain
+
+        # ── Local terrain roughness map (per-pixel dh) ────────────
+        # Computes std-dev of terrain in a ~100 m neighbourhood around
+        # every output pixel. This gives the fine-grained clutter-like
+        # texture CloudRF shows near the transmitter - textures that a
+        # purely distance-based ITM area model can never produce.
+        t_rough = time.time()
+        local_dh = self._compute_local_roughness(
+            elev_grid, n_cells,
+            lat_min, lat_max, lon_min, lon_max,
+            neighbourhood_m=120.0,
+        )
+        t_rough_ms = (time.time() - t_rough) * 1000
+
+        # Clutter baseline from environment preset (rural/suburban/urban/dense_urban).
+        # Matches CloudRF "Context" behaviour.  These are modest, because the
+        # base path-loss models already include some statistical clutter.
+        clutter_baseline = {
+            "rural":       0.0,
+            "suburban":    3.0,
+            "urban":       8.0,
+            "dense_urban": 14.0,
+        }.get(clutter_preset, 3.0)
+
+        # Frequency scaling for clutter/roughness loss
+        # (higher frequencies attenuate more in clutter)
+        freq_factor = float(np.clip(0.5 + np.log10(max(freq, 1.0) / 150.0) * 0.5, 0.4, 1.8))
+
+        # Local clutter loss per pixel: grows with local terrain std
+        # (0 for flat, ~12 dB for dh=30 m, ~18 dB for dh=100 m).
+        # Scales with frequency factor.
+        local_clutter = (
+            6.0 * np.log10(1.0 + local_dh * 0.25) * freq_factor
+        ).astype(np.float32)
+        logger.info(
+            f"  Local roughness: {t_rough_ms:.0f}ms "
+            f"(dh median={float(np.median(local_dh)):.1f}m, "
+            f"p95={float(np.percentile(local_dh, 95)):.1f}m)"
+        )
 
         # ── Per-pixel terrain-aware knife-edge diffraction (CUDA) ──
         # Replaces the old radial-sweep with profile quantised to ~15 pts,
@@ -344,6 +405,11 @@ class CoverageEngine:
 
         # Apply diffraction to link budget
         rx_power -= diff_grid
+
+        # Apply local clutter loss (per-pixel terrain roughness) and
+        # global clutter baseline. Only inside the coverage disc.
+        rx_power -= local_clutter
+        rx_power -= np.float32(clutter_baseline)
 
         # Apply units and threshold
         if units == "dB":
@@ -477,6 +543,81 @@ class CoverageEngine:
                 "free_space_loss": round(float(free_space(d_total / 1000, freq)), 1),
             },
         }
+
+    def _compute_local_roughness(
+        self,
+        elev_grid: np.ndarray,
+        n_cells: int,
+        lat_min: float,
+        lat_max: float,
+        lon_min: float,
+        lon_max: float,
+        neighbourhood_m: float = 100.0,
+    ) -> np.ndarray:
+        """
+        Per-pixel local terrain roughness (dh = local std of terrain).
+
+        Computes std-dev of the elevation grid in a ~neighbourhood_m box
+        around each terrain cell, then bilinearly resamples onto the
+        (n_cells x n_cells) output grid. This is the clutter-like
+        texture that CloudRF gets for free from its DSM+landcover.
+
+        Returns a (n_cells, n_cells) float32 array of dh in meters.
+        """
+        try:
+            from scipy.ndimage import uniform_filter
+        except ImportError:
+            logger.warning("scipy unavailable; local roughness disabled")
+            return np.zeros((n_cells, n_cells), dtype=np.float32)
+
+        terrain_h, terrain_w = elev_grid.shape
+        if terrain_h < 3 or terrain_w < 3:
+            return np.zeros((n_cells, n_cells), dtype=np.float32)
+
+        # Terrain resolution in meters (use lat axis, close enough)
+        span_m = (lat_max - lat_min) * 111320.0
+        cell_m = span_m / max(terrain_h - 1, 1)
+        box = max(3, int(round(neighbourhood_m / max(cell_m, 1.0))))
+        if box % 2 == 0:
+            box += 1  # odd box size for symmetric window
+
+        elev_f = elev_grid.astype(np.float32, copy=False)
+        mean_h = uniform_filter(elev_f, size=box, mode="nearest")
+        mean_h2 = uniform_filter(elev_f * elev_f, size=box, mode="nearest")
+        var_h = np.maximum(mean_h2 - mean_h * mean_h, 0.0)
+        dh = np.sqrt(var_h, dtype=np.float32)
+
+        # Resample to output grid using vectorized bilinear interpolation
+        out_lats = np.linspace(lat_max, lat_min, n_cells, dtype=np.float32)
+        out_lons = np.linspace(lon_min, lon_max, n_cells, dtype=np.float32)
+        rr = np.clip(
+            (lat_max - out_lats) / max(lat_max - lat_min, 1e-9) * (terrain_h - 1),
+            0, terrain_h - 1,
+        ).astype(np.float32)
+        cc = np.clip(
+            (out_lons - lon_min) / max(lon_max - lon_min, 1e-9) * (terrain_w - 1),
+            0, terrain_w - 1,
+        ).astype(np.float32)
+
+        r0 = np.floor(rr).astype(np.int32)
+        c0 = np.floor(cc).astype(np.int32)
+        r1 = np.minimum(r0 + 1, terrain_h - 1)
+        c1 = np.minimum(c0 + 1, terrain_w - 1)
+        fr = (rr - r0.astype(np.float32))[:, None]
+        fc = (cc - c0.astype(np.float32))[None, :]
+
+        h00 = dh[np.ix_(r0, c0)]
+        h01 = dh[np.ix_(r0, c1)]
+        h10 = dh[np.ix_(r1, c0)]
+        h11 = dh[np.ix_(r1, c1)]
+
+        out = (
+            h00 * (1.0 - fr) * (1.0 - fc)
+            + h01 * (1.0 - fr) * fc
+            + h10 * fr * (1.0 - fc)
+            + h11 * fr * fc
+        ).astype(np.float32)
+        return out
 
     def _render_heatmap(self, grid: np.ndarray, schema_name: str) -> bytes:
         """Render coverage grid as PNG. Vectorized color mapping."""

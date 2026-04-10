@@ -1,0 +1,55 @@
+2026-04-09 23:37:27,617 [INFO] app.terrain.lidar_terrain: LiDAR: 8 MNT tiles indexed, 8 with MHC
+2026-04-09 23:37:27,617 [INFO] app.coverage.engine: CoverageEngine: GPU acceleration ENABLED
+INFO:     Started server process [29044]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-04-09 23:37:31,455 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:37:33,545 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:37:33,568 [INFO] app.coverage.engine: Coverage: 2000x2000 @ 10m | Terrain: 2000x2000 [LiDAR] +MHC clutter 4089ms
+2026-04-09 23:37:34,249 [INFO] app.coverage.engine:   Local roughness: 306ms (dh median=3.4m, p95=8.6m)
+2026-04-09 23:37:34,252 [INFO] app.coverage.cuda_kernels: CUDA diffraction kernel compiled
+2026-04-09 23:37:34,421 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 172ms
+2026-04-09 23:37:34,429 [INFO] app.coverage.engine:   Link budget + mask: 861ms
+2026-04-09 23:37:35,697 [INFO] app.coverage.engine:   Render: 1266ms | TOTAL: 6335ms | Coverage: 46.3%
+INFO:     127.0.0.1:53739 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51643 - "GET /api/tiles/dde9e9c2.png HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51644 - "GET /api/health HTTP/1.1" 200 OK
+2026-04-09 23:37:38,177 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 1000x1000 px, 2 tiles (21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:37:40,992 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 1000x1000 px, 2 tiles (21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:37:40,996 [INFO] app.coverage.engine: Coverage: 1000x1000 @ 10m | Terrain: 1000x1000 [LiDAR] +MHC clutter 3334ms
+2026-04-09 23:37:41,109 [INFO] app.coverage.engine:   Local roughness: 26ms (dh median=2.8m, p95=7.9m)
+2026-04-09 23:37:41,116 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 7ms
+2026-04-09 23:37:41,117 [INFO] app.coverage.engine:   Link budget + mask: 121ms
+2026-04-09 23:37:41,450 [INFO] app.coverage.engine:   Render: 332ms | TOTAL: 3922ms | Coverage: 60.6%
+INFO:     127.0.0.1:51644 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51888 - "GET /api/tiles/4f1989f4.png HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51890 - "GET /api/tiles/56786ad1.png HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51892 - "GET /api/tiles/25abb0aa.png HTTP/1.1" 200 OK
+2026-04-09 23:38:51,450 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:38:52,880 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:38:52,908 [INFO] app.coverage.engine: Coverage: 2000x2000 @ 10m | Terrain: 2000x2000 [LiDAR] +MHC clutter 2882ms
+2026-04-09 23:38:53,371 [INFO] app.coverage.engine:   Local roughness: 113ms (dh median=3.4m, p95=8.6m)
+2026-04-09 23:38:53,400 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 29ms
+2026-04-09 23:38:53,407 [INFO] app.coverage.engine:   Link budget + mask: 499ms
+2026-04-09 23:38:54,623 [INFO] app.coverage.engine:   Render: 1214ms | TOTAL: 4724ms | Coverage: 46.3%
+INFO:     127.0.0.1:58003 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55049 - "GET /api/tiles/564ae4c9.png HTTP/1.1" 200 OK
+2026-04-09 23:39:40,752 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:39:42,483 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:39:42,503 [INFO] app.coverage.engine: Coverage: 2000x2000 @ 10m | Terrain: 2000x2000 [LiDAR] +MHC clutter 3193ms
+2026-04-09 23:39:42,963 [INFO] app.coverage.engine:   Local roughness: 115ms (dh median=3.4m, p95=8.6m)
+2026-04-09 23:39:42,993 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 30ms
+2026-04-09 23:39:43,001 [INFO] app.coverage.engine:   Link budget + mask: 498ms
+2026-04-09 23:39:44,236 [INFO] app.coverage.engine:   Render: 1234ms | TOTAL: 5058ms | Coverage: 46.4%
+INFO:     127.0.0.1:63108 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62399 - "GET /api/tiles/5f10a26d.png HTTP/1.1" 200 OK
+2026-04-09 23:40:51,776 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:40:53,212 [INFO] app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-09 23:40:53,233 [INFO] app.coverage.engine: Coverage: 2000x2000 @ 10m | Terrain: 2000x2000 [LiDAR] +MHC clutter 2889ms
+2026-04-09 23:40:53,707 [INFO] app.coverage.engine:   Local roughness: 118ms (dh median=3.4m, p95=8.6m)
+2026-04-09 23:40:53,738 [INFO] app.coverage.engine:   Diffraction (CUDA, per-pixel): 31ms
+2026-04-09 23:40:53,745 [INFO] app.coverage.engine:   Link budget + mask: 512ms
+2026-04-09 23:40:54,972 [INFO] app.coverage.engine:   Render: 1225ms | TOTAL: 4753ms | Coverage: 46.4%
+INFO:     127.0.0.1:60250 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54303 - "GET /api/tiles/8562ac63.png HTTP/1.1" 200 OK
