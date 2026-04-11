@@ -251,8 +251,21 @@ class CoverageEngine:
                 dataset_type="mnt", max_pixels=max_terrain_px,
             )
             if mnt_block is not None:
-                base_grid = np.nan_to_num(mnt_block[0], nan=0.0).astype(np.float32, copy=False)
+                base_grid = mnt_block[0].astype(np.float32, copy=False)
                 terrain_source = "LiDAR"
+
+                # Fill NaN (areas outside LiDAR coverage) with SRTM
+                nan_mask = np.isnan(base_grid)
+                if np.any(nan_mask):
+                    # NaN pixels filled using SRTM fallback below
+                    t_h, t_w = base_grid.shape
+                    t_lats = np.linspace(lat_max, lat_min, t_h)
+                    t_lons = np.linspace(lon_min, lon_max, t_w)
+                    nan_rows, nan_cols = np.where(nan_mask)
+                    for r, c in zip(nan_rows, nan_cols):
+                        base_grid[r, c] = self.terrain.fallback.get_elevation(
+                            t_lats[r], t_lons[c]) if hasattr(self.terrain, 'fallback') else 0.0
+                base_grid = np.nan_to_num(base_grid, nan=0.0)
 
                 # Try to also read MHC (canopy + buildings) at same shape
                 mhc_block = self.terrain.read_block(
@@ -266,7 +279,7 @@ class CoverageEngine:
                 else:
                     elev_grid = base_grid
 
-        # Fallback to point-by-point if no block read (no LiDAR)
+        # Fallback to point-by-point if no LiDAR at all
         if elev_grid is None:
             terrain_n = min(500, n_cells)
             base_grid = np.zeros((terrain_n, terrain_n), dtype=np.float32)
@@ -275,7 +288,7 @@ class CoverageEngine:
             for r in range(terrain_n):
                 for c in range(terrain_n):
                     base_grid[r, c] = self.terrain.get_elevation(t_lats[r], t_lons[c])
-            base_grid = np.nan_to_num(base_grid, nan=0.0)
+            base_grid = np.nan_to_num(base_grid, nan=0.0).astype(np.float32)
             elev_grid = base_grid
 
         terrain_h, terrain_w = elev_grid.shape

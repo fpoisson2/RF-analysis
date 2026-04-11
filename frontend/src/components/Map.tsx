@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
+// deck.gl removed — MapLibre fill-extrusion with GPU hardware acceleration is fast enough
 import { AreaResponse } from '../types';
 import { Locale, t } from '../i18n';
 import { Layers, Mountain, TreePine, Building2, X, Box } from 'lucide-react';
@@ -367,38 +368,75 @@ export const MapView = React.memo(function MapView({
     }
   }, [view3D, mapReady]);
 
-  // 3D buildings via vector tiles (GPU-efficient, loads only visible tiles)
+  // 3D buildings via MapLibre fill-extrusion (sits on terrain, GPU accelerated)
+  const lastBuildingsLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    const addBuildings = () => {
-      if (map.getSource('buildings-3d-source')) return; // already added
+    const lat = txPosition[1];
+    const lon = txPosition[0];
+    const buildingsRadius = Math.min(Math.max(radius, 2), 100);
 
-      map.addSource('buildings-3d-source', {
-        type: 'vector',
-        tiles: [window.location.origin + '/api/buildings/tiles/{z}/{x}/{y}.pbf'],
-        minzoom: 10,
-        maxzoom: 14,
-      });
-      map.addLayer({
-        id: 'buildings-3d',
-        type: 'fill-extrusion',
-        source: 'buildings-3d-source',
-        'source-layer': 'buildings',
-        paint: {
-          'fill-extrusion-color': '#b0b0b0',
-          'fill-extrusion-height': ['get', 'h'],
-          'fill-extrusion-base': 0,
-          'fill-extrusion-opacity': 0.7,
-        },
-      });
-      setBuildingsLoaded(true);
+    // Skip if TX hasn't moved much
+    const prev = lastBuildingsLoad.current;
+    if (prev) {
+      const dlat = (lat - prev.lat) * 111320;
+      const dlon = (lon - prev.lon) * 111320 * Math.cos(lat * Math.PI / 180);
+      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(buildingsRadius - prev.radius) < 0.5) return;
+    }
+
+    let cancelled = false;
+
+    const loadBuildings = async () => {
+      try {
+        const bResp = await fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`);
+        if (!bResp.ok || cancelled) return;
+        const data = await bResp.json();
+        if (!data?.features || cancelled) return;
+
+        const features = data.features
+          .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
+          .map((f: any) => {
+            const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
+            return { ...f, properties: { ...f.properties, height: h } };
+          });
+
+        if (cancelled || features.length === 0) return;
+
+        try {
+          if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
+          if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
+        } catch (_) { /* ignore */ }
+
+        map.addSource('buildings-3d-source', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features },
+        });
+        map.addLayer({
+          id: 'buildings-3d',
+          type: 'fill-extrusion',
+          source: 'buildings-3d-source',
+          minzoom: 11,
+          paint: {
+            'fill-extrusion-color': '#b0b0b0',
+            'fill-extrusion-height': ['get', 'height'],
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.7,
+          },
+        });
+        setBuildingsLoaded(true);
+        lastBuildingsLoad.current = { lat, lon, radius: buildingsRadius };
+        console.log(`3D buildings loaded: ${features.length} features`);
+      } catch (e) {
+        console.error('3D buildings failed:', e);
+      }
     };
 
-    if (map.isStyleLoaded() && map.loaded()) addBuildings();
-    else map.once('idle', addBuildings);
-  }, [mapReady]);
+    loadBuildings();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [txPosition[0], txPosition[1], radius, mapReady]);
 
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];

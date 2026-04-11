@@ -622,18 +622,33 @@ _GRID_RES = 0.01  # ~1km grid cells for spatial index
 
 
 def _ensure_buildings_indexed():
-    """Load and spatially index all buildings for fast MVT tile generation."""
+    """Load and spatially index all buildings for fast MVT tile generation.
+    Uses cached buildings (with LiDAR heights + OSM) if available."""
     if _buildings_spatial_index["loaded"]:
         return _buildings_spatial_index["features"]
 
-    import json as _json
+    import json as _json, glob
+
     features = []
-    buildings_path = os.path.join(DATA_DIR, "buildings", "quebec_city_batiments.geojson")
-    if os.path.exists(buildings_path):
-        logger.info("Indexing buildings for MVT serving...")
-        with open(buildings_path) as f:
-            data = _json.load(f)
-        for feat in data.get("features", []):
+
+    # Try loading from buildings cache first (has LiDAR heights + OSM data)
+    cache_files = sorted(glob.glob(os.path.join(BUILDINGS_CACHE_DIR, "buildings_*.json")),
+                         key=os.path.getsize, reverse=True)
+    source_data = None
+    if cache_files:
+        logger.info(f"Loading MVT buildings from cache: {cache_files[0]}")
+        with open(cache_files[0]) as f:
+            source_data = _json.load(f)
+    else:
+        # Fallback: load raw local file
+        buildings_path = os.path.join(DATA_DIR, "buildings", "quebec_city_batiments.geojson")
+        if os.path.exists(buildings_path):
+            logger.info("Loading MVT buildings from raw GeoJSON (no cache yet)...")
+            with open(buildings_path) as f:
+                source_data = _json.load(f)
+
+    if source_data:
+        for feat in source_data.get("features", []):
             geom = feat.get("geometry")
             if not geom:
                 continue
@@ -649,19 +664,11 @@ def _ensure_buildings_indexed():
                 clon = sum(p[0] for p in ring) / len(ring)
 
                 props = feat.get("properties", {})
-                # Pre-compute height
-                height = 8.0
-                btype = (props.get("TYPE_BATIMENT") or "").lower()
-                if "commercial" in btype or "industriel" in btype:
-                    height = 12.0
-                elif "public" in btype or "institutionnel" in btype or "municipal" in btype:
-                    height = 15.0
-                elif "école" in btype or "ecole" in btype:
-                    height = 12.0
-                elif "église" in btype or "eglise" in btype:
-                    height = 20.0
-                elif "hôpital" in btype or "hopital" in btype:
-                    height = 20.0
+                height = props.get("_height") or props.get("height") or 8.0
+                try:
+                    height = float(height)
+                except (ValueError, TypeError):
+                    height = 8.0
 
                 features.append({
                     "geometry": geom,
@@ -785,6 +792,73 @@ def _load_local_buildings():
     return _local_buildings_cache["data"]
 
 
+@app.get("/api/data/buildings_binary")
+def get_buildings_binary(lat: float, lon: float, radius_km: float = 2.0):
+    """Serve buildings in a compact binary format for deck.gl.
+    Returns: JSON with flat arrays instead of GeoJSON features.
+    Much smaller and faster to parse than full GeoJSON."""
+    import json as _json
+
+    # Use disk cache
+    cache_key_str = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
+    bin_cache = os.path.join(BUILDINGS_CACHE_DIR, f"buildings_bin_{cache_key_str}.json")
+    if os.path.exists(bin_cache):
+        return FileResponse(bin_cache, media_type="application/json",
+                           headers={"Cache-Control": "public, max-age=86400"})
+
+    # Get full buildings (from existing cache or compute)
+    full_cache = os.path.join(BUILDINGS_CACHE_DIR, f"buildings_{cache_key_str}.json")
+    if os.path.exists(full_cache):
+        with open(full_cache) as f:
+            data = _json.load(f)
+    else:
+        data = get_buildings(lat, lon, radius_km)
+
+    # Convert to flat arrays: polygons as [positions[], heights[], polygon_indices[]]
+    positions = []    # flat [lon, lat, lon, lat, ...]
+    heights = []      # one per polygon
+    poly_starts = [0] # start index in positions for each polygon
+    n_verts_total = 0
+
+    for feat in data.get("features", []):
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        h = feat.get("properties", {}).get("_height", 8.0)
+        try:
+            h = float(h)
+        except:
+            h = 8.0
+
+        if geom["type"] == "Polygon":
+            rings = [geom["coordinates"][0]]
+        elif geom["type"] == "MultiPolygon":
+            rings = [poly[0] for poly in geom["coordinates"]]
+        else:
+            continue
+
+        for ring in rings:
+            for pt in ring:
+                positions.append(round(pt[0], 5))
+                positions.append(round(pt[1], 5))
+                n_verts_total += 1
+            heights.append(h)
+            poly_starts.append(n_verts_total)
+
+    result = {
+        "positions": positions,
+        "heights": heights,
+        "polyStarts": poly_starts,
+        "count": len(heights),
+    }
+
+    with open(bin_cache, 'w') as f:
+        _json.dump(result, f)
+
+    return FileResponse(bin_cache, media_type="application/json",
+                       headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/api/data/buildings")
 def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
     """Get building footprints near a point (local data + OSM). Cached to disk."""
@@ -799,17 +873,27 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
 
     local_data = _load_local_buildings()
 
-    # Also fetch OSM buildings (cached, max 3km to avoid Overpass timeout)
-    osm_radius = min(radius_km, 3.0)
-    cache_key = (round(lat, 2), round(lon, 2), round(osm_radius))
-    if cache_key not in _osm_cache:
-        _osm_cache[cache_key] = _fetch_osm_buildings(lat, lon, osm_radius)
-        # Keep cache small
-        if len(_osm_cache) > 20:
-            oldest = next(iter(_osm_cache))
-            del _osm_cache[oldest]
+    # Fetch OSM buildings in grid cells (10km each to avoid Overpass timeout)
+    osm_features = []
+    osm_cell_size = 0.09  # ~10km in degrees
+    cos_lat_v = math.cos(math.radians(lat))
+    lat_lo = lat - radius_km / 111.32
+    lat_hi = lat + radius_km / 111.32
+    lon_lo = lon - radius_km / (111.32 * cos_lat_v)
+    lon_hi = lon + radius_km / (111.32 * cos_lat_v)
 
-    osm_features = _osm_cache.get(cache_key, [])
+    import numpy as _np
+    grid_lats = _np.arange(lat_lo, lat_hi, osm_cell_size)
+    grid_lons = _np.arange(lon_lo, lon_hi, osm_cell_size)
+
+    for glat in grid_lats:
+        for glon in grid_lons:
+            cell_key = (round(glat / osm_cell_size), round(glon / osm_cell_size))
+            if cell_key not in _osm_cache:
+                cell_lat = glat + osm_cell_size / 2
+                cell_lon = glon + osm_cell_size / 2
+                _osm_cache[cell_key] = _fetch_osm_buildings(cell_lat, cell_lon, osm_cell_size * 111.32 / 2)
+            osm_features.extend(_osm_cache.get(cell_key, []))
 
     # Deduplicate: remove local buildings whose centroid is inside any OSM bounding box
     # Build list of OSM bounding boxes
