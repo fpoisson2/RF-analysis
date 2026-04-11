@@ -112,130 +112,160 @@ export const MapView = React.memo(function MapView({
   const coordsRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const markerRef = useRef<maplibregl.Marker | null>(null);
+  const cleanupRef = useRef<(() => void) | null>(null);
   const onMapClickRef = useRef(onMapClick);
   const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const [loadingTerrain, setLoadingTerrain] = useState(false);
   const [view3D, setView3D] = useState(false);
   const [buildingsLoaded, setBuildingsLoaded] = useState(false);
+  const [mapReady, setMapReady] = useState(0); // increment to signal map created
 
   onMapClickRef.current = onMapClick;
 
   // Initialize map
   useEffect(() => {
     if (!containerRef.current) return;
+    let cancelled = false;
 
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: darkMode
-        ? 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
-        : 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-      center: txPosition,
-      zoom: 11,
-      attributionControl: false,
-      maxPitch: 85,
+    const demTilesUrl = window.location.origin + '/api/terrain/dem/{z}/{x}/{y}.png';
+    const cartoStyleUrl = darkMode
+      ? 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
+      : 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json';
+
+    // Fetch CARTO style, inject DEM + terrain, then create map
+    fetch(cartoStyleUrl).then(r => r.json()).catch(() => ({
+      version: 8, sources: {}, layers: [],
+    })).then((style: any) => {
+      if (cancelled || !containerRef.current) return;
+
+      // Inject DEM sources — AWS Terrarium tiles (fast CDN, global coverage)
+      style.sources['terrain-dem'] = {
+        type: 'raster-dem',
+        tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+        encoding: 'terrarium',
+        tileSize: 256,
+        maxzoom: 15,
+      };
+      style.sources['hillshade-dem'] = {
+        type: 'raster-dem',
+        tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+        encoding: 'terrarium',
+        tileSize: 256,
+        maxzoom: 15,
+      };
+
+      // 3D terrain extrusion via style (not setTerrain API)
+      style.terrain = { source: 'terrain-dem', exaggeration: 1.5 };
+      style.sky = {};
+
+      // Hillshade under all layers
+      style.layers.unshift({
+        id: 'hillshade-layer',
+        type: 'hillshade',
+        source: 'hillshade-dem',
+        paint: {
+          'hillshade-shadow-color': darkMode ? '#000000' : '#473B24',
+          'hillshade-exaggeration': 0.5,
+        },
+      });
+
+      const map = new maplibregl.Map({
+        container: containerRef.current!,
+        style,
+        center: txPosition,
+        zoom: 11,
+        attributionControl: false,
+        maxPitch: 85,
+      });
+
+      map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+      map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
+      map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
+      map.addControl(new maplibregl.TerrainControl({ source: 'terrain-dem', exaggeration: 1.5 }));
+
+      map.on('click', (e) => {
+        const target = (e.originalEvent as MouseEvent)?.target as HTMLElement;
+        if (target && !target.closest('.maplibregl-canvas')) return;
+        onMapClickRef.current(e.lngLat.lat, e.lngLat.lng);
+      });
+
+      map.on('mousemove', (e) => {
+        if (coordsRef.current) {
+          coordsRef.current.textContent = `${e.lngLat.lat.toFixed(6)}, ${e.lngLat.lng.toFixed(6)}`;
+        }
+      });
+
+      const el = createTxMarkerElement();
+      const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'bottom' })
+        .setLngLat(txPosition)
+        .addTo(map);
+
+      marker.on('dragend', () => {
+        const pos = marker.getLngLat();
+        onMapClickRef.current(pos.lat, pos.lng);
+      });
+
+      markerRef.current = marker;
+      mapRef.current = map;
+      // Signal other effects once the map is fully loaded
+      map.once('idle', () => setMapReady(n => n + 1));
+
+      // Middle-mouse-button drag = rotate + pitch (3D navigation)
+      const canvas = map.getCanvas();
+      let midDrag = false;
+      let lastX = 0;
+      let lastY = 0;
+
+      const onMidDown = (e: MouseEvent) => {
+        if (e.button !== 1) return;
+        e.preventDefault();
+        midDrag = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        canvas.style.cursor = 'grabbing';
+        map.dragPan.disable();
+      };
+      const onMidMove = (e: MouseEvent) => {
+        if (!midDrag) return;
+        e.preventDefault();
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        const bearing = map.getBearing() + dx * 0.5;
+        const pitch = Math.max(0, Math.min(85, map.getPitch() - dy * 0.5));
+        map.jumpTo({ bearing, pitch });
+      };
+      const onMidUp = (e: MouseEvent) => {
+        if (e.button !== 1 || !midDrag) return;
+        midDrag = false;
+        canvas.style.cursor = '';
+        map.dragPan.enable();
+      };
+      const onMidDownPrevent = (e: MouseEvent) => {
+        if (e.button === 1) e.preventDefault();
+      };
+
+      canvas.addEventListener('mousedown', onMidDown);
+      canvas.addEventListener('auxclick', onMidDownPrevent);
+      window.addEventListener('mousemove', onMidMove);
+      window.addEventListener('mouseup', onMidUp);
+
+      cleanupRef.current = () => {
+        canvas.removeEventListener('mousedown', onMidDown);
+        canvas.removeEventListener('auxclick', onMidDownPrevent);
+        window.removeEventListener('mousemove', onMidMove);
+        window.removeEventListener('mouseup', onMidUp);
+        marker.remove();
+        map.remove();
+        markerRef.current = null;
+        mapRef.current = null;
+      };
     });
-
-    // Globe projection + atmosphere (deferred until style is ready)
-    map.on('load', () => {
-      try { (map as any).setProjection?.({ type: 'globe' }); } catch (e) { /* not supported */ }
-      try {
-        (map as any).setFog?.({
-          color: 'rgb(186, 210, 235)',
-          'high-color': 'rgb(36, 92, 223)',
-          'horizon-blend': 0.02,
-          'space-color': 'rgb(11, 11, 25)',
-          'star-intensity': 0.6,
-          range: [0.5, 10],
-        });
-      } catch (e) { /* fog not supported */ }
-    });
-
-    map.addControl(new maplibregl.NavigationControl(), 'top-right');
-    map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
-
-    map.on('click', (e) => {
-      // Only move TX when clicking directly on the map canvas, not overlay buttons
-      const target = (e.originalEvent as MouseEvent)?.target as HTMLElement;
-      if (target && !target.closest('.maplibregl-canvas')) return;
-      onMapClickRef.current(e.lngLat.lat, e.lngLat.lng);
-    });
-
-    map.on('mousemove', (e) => {
-      if (coordsRef.current) {
-        coordsRef.current.textContent = `${e.lngLat.lat.toFixed(6)}, ${e.lngLat.lng.toFixed(6)}`;
-      }
-    });
-
-    const el = createTxMarkerElement();
-    const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'bottom' })
-      .setLngLat(txPosition)
-      .addTo(map);
-
-    marker.on('dragend', () => {
-      const pos = marker.getLngLat();
-      onMapClickRef.current(pos.lat, pos.lng);
-    });
-
-    markerRef.current = marker;
-    mapRef.current = map;
-
-    // --- Middle-mouse-button drag = rotate + pitch (3D navigation) -----
-    // MapLibre's default dragRotate only uses right-click/ctrl-left; we
-    // add middle-click (button 1) as an additional rotate/pitch gesture
-    // so users can fly around the 3D scene without needing modifier keys.
-    const canvas = map.getCanvas();
-    let midDrag = false;
-    let lastX = 0;
-    let lastY = 0;
-
-    const onMidDown = (e: MouseEvent) => {
-      if (e.button !== 1) return;
-      e.preventDefault();
-      midDrag = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      canvas.style.cursor = 'grabbing';
-      // Disable default click-pan while middle drag is active
-      map.dragPan.disable();
-    };
-    const onMidMove = (e: MouseEvent) => {
-      if (!midDrag) return;
-      e.preventDefault();
-      const dx = e.clientX - lastX;
-      const dy = e.clientY - lastY;
-      lastX = e.clientX;
-      lastY = e.clientY;
-
-      const bearing = map.getBearing() + dx * 0.5;     // drag right = rotate clockwise
-      const pitch = Math.max(0, Math.min(85, map.getPitch() - dy * 0.5));  // drag up = tilt more
-      map.jumpTo({ bearing, pitch });
-    };
-    const onMidUp = (e: MouseEvent) => {
-      if (e.button !== 1 || !midDrag) return;
-      midDrag = false;
-      canvas.style.cursor = '';
-      map.dragPan.enable();
-    };
-    // Kill the browser's middle-click auto-scroll
-    const onMidDownPrevent = (e: MouseEvent) => {
-      if (e.button === 1) e.preventDefault();
-    };
-
-    canvas.addEventListener('mousedown', onMidDown);
-    canvas.addEventListener('auxclick', onMidDownPrevent);
-    window.addEventListener('mousemove', onMidMove);
-    window.addEventListener('mouseup', onMidUp);
 
     return () => {
-      canvas.removeEventListener('mousedown', onMidDown);
-      canvas.removeEventListener('auxclick', onMidDownPrevent);
-      window.removeEventListener('mousemove', onMidMove);
-      window.removeEventListener('mouseup', onMidUp);
-      marker.remove();
-      map.remove();
-      markerRef.current = null;
-      mapRef.current = null;
+      cancelled = true;
+      cleanupRef.current?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [darkMode]);
@@ -249,7 +279,7 @@ export const MapView = React.memo(function MapView({
         markerRef.current.setLngLat(txPosition);
       }
     }
-  }, [txPosition[0], txPosition[1]]);
+  }, [txPosition[0], txPosition[1], mapReady]);
 
   // Coverage overlay
   useEffect(() => {
@@ -270,13 +300,12 @@ export const MapView = React.memo(function MapView({
         id: 'coverage-layer',
         type: 'raster',
         source: 'coverage-source',
-        paint: { 'raster-opacity': 0.75 },
+        paint: { 'raster-opacity': 0.55 },
       });
     };
 
-    if (map.isStyleLoaded()) add();
-    else map.once('load', add);
-  }, [coverageResult]);
+    add();
+  }, [coverageResult, mapReady]);
 
   // Terrain/canopy layer overlay
   useEffect(() => {
@@ -320,161 +349,57 @@ export const MapView = React.memo(function MapView({
           }, map.getLayer('coverage-layer') ? 'coverage-layer' : undefined);
         };
 
-        if (map.isStyleLoaded()) add();
-        else map.once('load', add);
+        add();
       })
       .catch(console.error)
       .finally(() => setLoadingTerrain(false));
-  }, [terrainLayer, txPosition[0], txPosition[1], radius]);
+  }, [terrainLayer, txPosition[0], txPosition[1], radius, mapReady]);
 
-  // 3D toggle: camera tilt + terrain DEM
+  // 3D toggle: camera tilt
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
     if (view3D) {
       map.easeTo({ pitch: 60, bearing: -20, duration: 800 });
-      // Enable 3D terrain
-      try {
-        if (!map.getSource('terrain-dem')) {
-          map.addSource('terrain-dem', {
-            type: 'raster-dem',
-            tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-            tileSize: 256,
-            encoding: 'terrarium',
-            maxzoom: 15,
-          });
-        }
-        (map as any).setTerrain?.({ source: 'terrain-dem', exaggeration: 1.5 });
-      } catch (e) { console.warn('3D terrain failed:', e); }
     } else {
       map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
-      try {
-        (map as any).setTerrain?.(null);
-      } catch (e) { /* ignore */ }
     }
-  }, [view3D]);
+  }, [view3D, mapReady]);
 
-  // 3D buildings: always loaded around TX position.
-  // Buildings appear as fill-extrusion (visible from any camera angle).
+  // 3D buildings via vector tiles (GPU-efficient, loads only visible tiles)
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    let cancelled = false;
-    const lat = txPosition[1];
-    const lon = txPosition[0];
-    const buildingsRadius = Math.min(Math.max(radius, 1), 15);
+    const addBuildings = () => {
+      if (map.getSource('buildings-3d-source')) return; // already added
 
-    const removeBuildings = () => {
-      try {
-        if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
-        if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
-      } catch (e) { /* ignore */ }
+      map.addSource('buildings-3d-source', {
+        type: 'vector',
+        tiles: [window.location.origin + '/api/buildings/tiles/{z}/{x}/{y}.pbf'],
+        minzoom: 10,
+        maxzoom: 14,
+      });
+      map.addLayer({
+        id: 'buildings-3d',
+        type: 'fill-extrusion',
+        source: 'buildings-3d-source',
+        'source-layer': 'buildings',
+        paint: {
+          'fill-extrusion-color': '#b0b0b0',
+          'fill-extrusion-height': ['get', 'h'],
+          'fill-extrusion-base': 0,
+          'fill-extrusion-opacity': 0.7,
+        },
+      });
+      setBuildingsLoaded(true);
     };
 
-    const loadBuildings = async () => {
-      try {
-        const bResp = await fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`);
-        if (!bResp.ok || cancelled) return;
-        const data = await bResp.json();
-        if (!data?.features || cancelled) return;
+    if (map.isStyleLoaded() && map.loaded()) addBuildings();
+    else map.once('idle', addBuildings);
+  }, [mapReady]);
 
-        const features = data.features
-          .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
-          .map((f: any) => {
-            const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
-            const ring = f.geometry.type === 'Polygon'
-              ? f.geometry.coordinates[0]
-              : f.geometry.coordinates[0][0];
-            const cLat = ring.reduce((s: number, p: number[]) => s + p[1], 0) / ring.length;
-            const cLon = ring.reduce((s: number, p: number[]) => s + p[0], 0) / ring.length;
-            return {
-              ...f,
-              properties: { ...f.properties, height: h, centroid_lat: cLat, centroid_lon: cLon },
-            };
-          });
-
-        if (cancelled || features.length === 0) return;
-
-        // Batch-query signal values for rooftop coloring
-        try {
-          const buildingsIn = features.map((f: any) => ({
-            lat: f.properties.centroid_lat,
-            lon: f.properties.centroid_lon,
-            height: f.properties.height,
-          }));
-          const sigResp = await fetch('/api/coverage/buildings3d', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ buildings: buildingsIn }),
-          });
-          if (sigResp.ok && !cancelled) {
-            const sigData = await sigResp.json();
-            const results = sigData.results || [];
-            for (let idx = 0; idx < features.length && idx < results.length; idx++) {
-              features[idx].properties.signal_roof = results[idx].signal_roof;
-              features[idx].properties.signal_street = results[idx].signal_street;
-              features[idx].properties.delta_db = results[idx].delta_db;
-            }
-          }
-        } catch (e) {
-          console.warn('buildings3d signal query failed', e);
-        }
-
-        if (cancelled || !map) return;
-
-        removeBuildings();
-        map.addSource('buildings-3d-source', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features },
-        });
-        map.addLayer({
-          id: 'buildings-3d',
-          type: 'fill-extrusion',
-          source: 'buildings-3d-source',
-          paint: {
-            'fill-extrusion-color': [
-              'case',
-              ['has', 'signal_roof'],
-              [
-                'interpolate', ['linear'], ['get', 'signal_roof'],
-                -120, '#461eaa',
-                -100, '#0082d2',
-                -90,  '#00b478',
-                -80,  '#64e114',
-                -70,  '#dcf000',
-                -60,  '#ffbe00',
-                -50,  '#ff6e00',
-                -30,  '#ff1e1e',
-              ],
-              '#9ca3af',
-            ],
-            'fill-extrusion-height': ['get', 'height'],
-            'fill-extrusion-base': 0,
-            'fill-extrusion-opacity': 0.85,
-          },
-        });
-        setBuildingsLoaded(true);
-        console.log(`3D buildings loaded: ${features.length} features`);
-      } catch (e) {
-        console.error('3D buildings failed:', e);
-      }
-    };
-
-    // Wait for map to be fully loaded before adding buildings
-    if (map.isStyleLoaded()) {
-      loadBuildings();
-    } else {
-      map.once('load', () => { if (!cancelled) loadBuildings(); });
-    }
-
-    return () => {
-      cancelled = true;
-      removeBuildings();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [txPosition[0], txPosition[1], radius]);
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
   const fr = locale === 'fr';
