@@ -541,7 +541,7 @@ export const MapView = React.memo(function MapView({
 
     const lat = txPosition[1];
     const lon = txPosition[0];
-    const envRadius = Math.min(Math.max(radius, 1), 3);
+    const envRadius = Math.min(Math.max(radius, 2), 10);
 
     // Skip if TX hasn't moved much
     const prev = lastEnvLoad.current;
@@ -560,62 +560,98 @@ export const MapView = React.memo(function MapView({
         const data = await resp.json();
         if (cancelled) return;
 
-        // --- Individual 3D trees as fill-extrusion circles ---
+        // --- 3D trees ---
         const treeFeatures = data.trees?.features || [];
         if (treeFeatures.length > 0) {
           try {
             if (map.getLayer('trees-3d')) map.removeLayer('trees-3d');
-            if (map.getSource('trees-source')) map.removeSource('trees-source');
+            if (map.getLayer('trees-trunk')) map.removeLayer('trees-trunk');
+            if (map.getSource('trees-3d-src')) map.removeSource('trees-3d-src');
+            if (map.getSource('trees-trunk-src')) map.removeSource('trees-trunk-src');
           } catch (_) { /* ignore */ }
 
-          // Convert points to small circular polygons for fill-extrusion
+          // Generate canopy + trunk hexagons from point data
           const cosLat = Math.cos((lat * Math.PI) / 180);
-          const treePolygons = treeFeatures.map((f: any) => {
-            const [lng, lt] = f.geometry.coordinates;
+          const canopyFeatures: any[] = [];
+          const trunkFeatures: any[] = [];
+
+          for (const f of treeFeatures) {
+            const [tlng, tlat] = f.geometry.coordinates;
             const h = f.properties.h || 8;
-            const r = Math.min(Math.max(h * 0.3, 1.5), 6); // canopy radius in meters
-            const dlat = r / 111320;
-            const dlng = r / (111320 * cosLat);
-            // Hexagon
-            const ring = [];
+
+            // Canopy hexagon (wide)
+            const cr = Math.max(3, h * 0.4);
+            const cdlat = cr / 111320;
+            const cdlng = cr / (111320 * cosLat);
+            const cring: number[][] = [];
             for (let i = 0; i < 6; i++) {
               const a = (Math.PI / 3) * i;
-              ring.push([
-                Math.round((lng + dlng * Math.cos(a)) * 1e7) / 1e7,
-                Math.round((lt + dlat * Math.sin(a)) * 1e7) / 1e7,
-              ]);
+              cring.push([tlng + cdlng * Math.cos(a), tlat + cdlat * Math.sin(a)]);
             }
-            ring.push(ring[0]);
-            return {
+            cring.push(cring[0]);
+            canopyFeatures.push({
               type: 'Feature',
-              geometry: { type: 'Polygon', coordinates: [ring] },
-              properties: { h },
-            };
+              geometry: { type: 'Polygon', coordinates: [cring] },
+              properties: { h, base: h * 0.3 },
+            });
+
+            // Trunk hexagon (thin)
+            const tr = Math.max(0.5, h * 0.06);
+            const tdlat = tr / 111320;
+            const tdlng = tr / (111320 * cosLat);
+            const tring: number[][] = [];
+            for (let i = 0; i < 6; i++) {
+              const a = (Math.PI / 3) * i;
+              tring.push([tlng + tdlng * Math.cos(a), tlat + tdlat * Math.sin(a)]);
+            }
+            tring.push(tring[0]);
+            trunkFeatures.push({
+              type: 'Feature',
+              geometry: { type: 'Polygon', coordinates: [tring] },
+              properties: { h: h * 0.3 },
+            });
+          }
+
+          // Trunk layer (brown, from ground to 30% height)
+          map.addSource('trees-trunk-src', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: trunkFeatures },
+          });
+          map.addLayer({
+            id: 'trees-trunk',
+            type: 'fill-extrusion',
+            source: 'trees-trunk-src',
+            paint: {
+              'fill-extrusion-color': '#5D4037',
+              'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
+              'fill-extrusion-base': 0,
+              'fill-extrusion-opacity': 0.9,
+            },
           });
 
-          map.addSource('trees-source', {
+          // Canopy layer (green, from 30% to 100% height)
+          map.addSource('trees-3d-src', {
             type: 'geojson',
-            data: { type: 'FeatureCollection', features: treePolygons },
+            data: { type: 'FeatureCollection', features: canopyFeatures },
           });
           map.addLayer({
             id: 'trees-3d',
             type: 'fill-extrusion',
-            source: 'trees-source',
-            minzoom: 13,
+            source: 'trees-3d-src',
             paint: {
               'fill-extrusion-color': [
                 'interpolate', ['linear'], ['get', 'h'],
                 3, '#7cb342',
-                8, '#43a047',
-                15, '#2e7d32',
-                25, '#1b5e20',
+                10, '#43a047',
+                20, '#2e7d32',
               ],
               'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
-              'fill-extrusion-base': 0,
-              'fill-extrusion-opacity': 0.7,
+              'fill-extrusion-base': ['*', ['get', 'base'], 1.5],
+              'fill-extrusion-opacity': 0.8,
             },
-          }, map.getLayer('buildings-3d') ? 'buildings-3d' : undefined);
-          console.log(`3D trees loaded: ${treeFeatures.length} trees`);
+          });
+
+          console.log(`3D trees: ${canopyFeatures.length} canopies + trunks`);
         }
 
         lastEnvLoad.current = { lat, lon, radius: envRadius };
@@ -634,10 +670,12 @@ export const MapView = React.memo(function MapView({
     const map = mapRef.current;
     if (!map) return;
     try {
-      if (map.getLayer('trees-3d')) {
-        map.setLayoutProperty('trees-3d', 'visibility', showVegetation ? 'visible' : 'none');
-      }
-    } catch (_) { /* layer may not exist yet */ }
+      const vis = showVegetation ? 'visible' : 'none';
+      try {
+        if (map.getLayer('trees-3d')) map.setLayoutProperty('trees-3d', 'visibility', vis);
+        if (map.getLayer('trees-trunk')) map.setLayoutProperty('trees-trunk', 'visibility', vis);
+      } catch(_) {}
+    } catch (_) { /* layers may not exist yet */ }
   }, [showVegetation, mapReady]);
 
   // Toggle roads visibility

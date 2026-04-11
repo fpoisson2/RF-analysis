@@ -1,9 +1,8 @@
 /**
- * Three.js custom MapLibre layer for rendering 3D trees.
+ * Three.js MapLibre custom layer — instanced 3D trees.
  *
- * Uses InstancedMesh for performance — each tree is a cone (canopy)
- * + cylinder (trunk) placed at its LiDAR-detected position with
- * correct height.
+ * Each tree = brown cylinder (trunk) + green icosphere (canopy).
+ * Heights from LiDAR are applied per-instance via InstancedMesh.
  */
 import * as THREE from 'three';
 import maplibregl from 'maplibre-gl';
@@ -11,18 +10,15 @@ import maplibregl from 'maplibre-gl';
 interface TreeData {
   lng: number;
   lat: number;
-  height: number;
+  height: number; // canopy height in meters (from LiDAR)
 }
 
-const TERRAIN_EXAGGERATION = 1.5;
+const TERRAIN_EXAG = 1.5;
 
 export function createTreeLayer(trees: TreeData[]): maplibregl.CustomLayerInterface {
   let renderer: THREE.WebGLRenderer;
   let scene: THREE.Scene;
   let camera: THREE.Camera;
-  let trunkMesh: THREE.InstancedMesh;
-  let canopyMesh: THREE.InstancedMesh;
-  let mapInstance: maplibregl.Map;
 
   return {
     id: 'trees-3d',
@@ -30,108 +26,88 @@ export function createTreeLayer(trees: TreeData[]): maplibregl.CustomLayerInterf
     renderingMode: '3d',
 
     onAdd(map: maplibregl.Map, gl: WebGLRenderingContext) {
-      mapInstance = map;
       camera = new THREE.Camera();
       scene = new THREE.Scene();
 
-      // Ambient + directional lighting
-      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-      const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-      sun.position.set(50, 100, 80).normalize();
+      // Lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+      const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+      sun.position.set(0, -70, 100).normalize();
       scene.add(sun);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.3);
+      fill.position.set(0, 70, 100).normalize();
+      scene.add(fill);
 
-      const count = trees.length;
+      const n = trees.length;
+      const mat4 = new THREE.Matrix4();
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scl = new THREE.Vector3();
 
-      // Trunk geometry: cylinder (radius 0.15m, height 1m — scaled per instance)
-      const trunkGeo = new THREE.CylinderGeometry(0.15, 0.2, 1, 5);
-      trunkGeo.translate(0, 0.5, 0); // pivot at base
+      // --- Trunks (cylinders) ---
+      const trunkGeo = new THREE.CylinderGeometry(0.12, 0.18, 1, 6);
+      trunkGeo.translate(0, 0.5, 0); // base at origin
       const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5D4037 });
-      trunkMesh = new THREE.InstancedMesh(trunkGeo, trunkMat, count);
+      const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, n);
 
-      // Canopy geometry: cone (radius 1m, height 1m — scaled per instance)
-      const canopyGeo = new THREE.ConeGeometry(1, 1, 6);
-      canopyGeo.translate(0, 0.5, 0); // pivot at base
-      const canopyMat = new THREE.MeshLambertMaterial({ color: 0x2E7D32 });
-      canopyMesh = new THREE.InstancedMesh(canopyGeo, canopyMat, count);
+      // --- Canopy (icosphere = organic/round look) ---
+      const canopyGeo = new THREE.IcosahedronGeometry(1, 1); // subdivision 1
+      canopyGeo.translate(0, 0.5, 0);
+      const canopyMat = new THREE.MeshLambertMaterial({
+        color: 0x388E3C,
+        flatShading: true,
+      });
+      const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, n);
 
-      // Assign random canopy color variation per instance
-      const greens = [
-        new THREE.Color(0x2E7D32), // dark green
-        new THREE.Color(0x388E3C),
-        new THREE.Color(0x43A047),
-        new THREE.Color(0x4CAF50), // medium green
-        new THREE.Color(0x1B5E20), // very dark green
-        new THREE.Color(0x33691E), // olive green
-      ];
+      // Green palette for variation
+      const greens = [0x2E7D32, 0x388E3C, 0x43A047, 0x1B5E20, 0x33691E, 0x558B2F]
+        .map(c => new THREE.Color(c));
 
-      const dummy = new THREE.Object3D();
+      for (let i = 0; i < n; i++) {
+        const t = trees[i];
+        const h = t.height * TERRAIN_EXAG;
 
-      for (let i = 0; i < count; i++) {
-        const tree = trees[i];
-        const h = tree.height * TERRAIN_EXAGGERATION;
+        const mc = maplibregl.MercatorCoordinate.fromLngLat([t.lng, t.lat], 0);
+        const s = mc.meterInMercatorCoordinateUnits();
 
-        // Convert lng/lat to Mercator coordinates
-        const mc = maplibregl.MercatorCoordinate.fromLngLat(
-          [tree.lng, tree.lat], 0
-        );
-        const scale = mc.meterInMercatorCoordinateUnits();
+        // Trunk: 30% of height, thin
+        const tH = h * 0.3;
+        const tR = Math.max(0.15, h * 0.025);
+        pos.set(mc.x, mc.y, mc.z!);
+        scl.set(tR * s, tH * s, tR * s);
+        mat4.compose(pos, quat, scl);
+        trunks.setMatrixAt(i, mat4);
 
-        // Trunk: height = 30% of tree, thin
-        const trunkH = h * 0.3;
-        const trunkRadius = Math.max(0.1, h * 0.03);
-        dummy.position.set(mc.x, mc.y, mc.z!);
-        dummy.scale.set(trunkRadius * scale, trunkH * scale, trunkRadius * scale);
-        dummy.updateMatrix();
-        trunkMesh.setMatrixAt(i, dummy.matrix);
+        // Canopy: 80% of height, wide sphere on top of trunk
+        const cH = h * 0.8;
+        const cR = Math.max(1.5, h * 0.22);
+        pos.set(mc.x, mc.y, mc.z! + tH * s);
+        scl.set(cR * s, cH * s, cR * s);
+        mat4.compose(pos, quat, scl);
+        canopies.setMatrixAt(i, mat4);
 
-        // Canopy: height = 70% of tree, wider
-        const canopyH = h * 0.7;
-        const canopyR = Math.max(1.5, h * 0.3);
-        dummy.position.set(mc.x, mc.y, mc.z! + trunkH * scale);
-        dummy.scale.set(canopyR * scale, canopyH * scale, canopyR * scale);
-        dummy.updateMatrix();
-        canopyMesh.setMatrixAt(i, dummy.matrix);
-
-        // Random green shade
-        canopyMesh.setColorAt(i, greens[i % greens.length]);
+        canopies.setColorAt(i, greens[i % greens.length]);
       }
 
-      trunkMesh.instanceMatrix.needsUpdate = true;
-      canopyMesh.instanceMatrix.needsUpdate = true;
-      if (canopyMesh.instanceColor) canopyMesh.instanceColor.needsUpdate = true;
+      trunks.instanceMatrix.needsUpdate = true;
+      canopies.instanceMatrix.needsUpdate = true;
+      if (canopies.instanceColor) canopies.instanceColor.needsUpdate = true;
 
-      scene.add(trunkMesh);
-      scene.add(canopyMesh);
+      scene.add(trunks);
+      scene.add(canopies);
 
       renderer = new THREE.WebGLRenderer({
         canvas: map.getCanvas(),
-        context: gl as any,
-        antialias: true,
+        context: gl as unknown as WebGL2RenderingContext,
       });
       renderer.autoClear = false;
     },
 
-    render(gl: WebGLRenderingContext, args: any) {
-      // Build projection matrix from MapLibre's projection data
+    render(_gl: WebGLRenderingContext, args: any) {
       const m = new THREE.Matrix4().fromArray(args.defaultProjectionData.mainMatrix);
       camera.projectionMatrix = m;
-
       renderer.resetState();
       renderer.render(scene, camera);
-    },
-
-    onRemove() {
-      if (trunkMesh) {
-        trunkMesh.geometry.dispose();
-        (trunkMesh.material as THREE.Material).dispose();
-      }
-      if (canopyMesh) {
-        canopyMesh.geometry.dispose();
-        (canopyMesh.material as THREE.Material).dispose();
-      }
-      if (renderer) {
-        renderer.dispose();
-      }
     },
   };
 }

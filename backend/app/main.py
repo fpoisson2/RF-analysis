@@ -1122,9 +1122,9 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     lat_range = radius_km / 111.32
     lon_range = radius_km / (111.32 * cos_lat_v)
 
-    # Read MHC block at ~5m resolution for tree detection
+    # Read MHC block — aim for ~5m resolution
     try:
-        max_px = min(800, int(radius_km * 1000 / 5 * 2))
+        max_px = min(2000, int(radius_km * 1000 / 5 * 2))
         block = terrain.read_block(
             lat - lat_range, lon - lon_range,
             lat + lat_range, lon + lon_range,
@@ -1199,6 +1199,7 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
                     bldg_mask[scan_r, c0:c1] = True
 
     # Find tree pixels: canopy > 2.5m and not a building
+    logger.info(f"Building mask: {bldg_mask.sum()} of {bldg_mask.size} pixels masked ({100*bldg_mask.sum()/bldg_mask.size:.1f}%)")
     tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (~bldg_mask)
 
     # Sample trees at intervals (avoid millions of points)
@@ -1212,45 +1213,38 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
 
     tree_points = tree_mask & local_max
 
-    # Convert to point features (Three.js handles 3D rendering)
-    features = []
-    max_trees = 20000  # cap for performance
-    count = 0
+    # Subsample tree_points at step intervals
+    sampled = np.zeros_like(tree_points)
+    s2 = max(1, step // 2)
+    sampled[::s2, ::s2] = tree_points[::s2, ::s2]
 
-    for r in range(0, h, max(1, step // 2)):
-        if count >= max_trees:
-            break
-        for c in range(0, w, max(1, step // 2)):
-            if count >= max_trees:
-                break
-            if not tree_points[r, c]:
-                continue
+    # Extract all tree positions at once (vectorized)
+    rows, cols = np.where(sampled)
+    heights = mhc_grid[rows, cols]
+    valid = (heights >= 2.5) & (heights <= 60)
+    rows, cols, heights = rows[valid], cols[valid], heights[valid]
 
-            canopy_h = float(mhc_grid[r, c])
-            if canopy_h < 2.5 or canopy_h > 60:
-                continue
+    # Convert pixel coords to lat/lon
+    lats = lat_max - (rows / h) * (lat_max - lat_min)
+    lons = lon_min + (cols / w) * (lon_max - lon_min)
 
-            # Convert pixel to lat/lon
-            pt_lat = lat_max - (r / h) * (lat_max - lat_min)
-            pt_lon = lon_min + (c / w) * (lon_max - lon_min)
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [round(float(lons[i]), 7), round(float(lats[i]), 7)]},
+            "properties": {"h": round(float(heights[i]), 1)},
+        }
+        for i in range(len(rows))
+    ]
 
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [round(pt_lon, 7), round(pt_lat, 7)]},
-                "properties": {
-                    "h": round(canopy_h, 1),
-                },
-            })
-            count += 1
-
-    logger.info(f"Tree detection: {count} trees found in {radius_km}km radius")
+    logger.info(f"Tree detection: {len(features)} trees found in {radius_km}km radius")
     return features
 
 
 @app.get("/api/data/environment")
 def get_environment(lat: float, lon: float, radius_km: float = 2.0):
     """Get individual trees (from LiDAR) and roads (from OSM) for 3D rendering."""
-    radius_km = min(radius_km, 3.0)  # cap for performance
+    radius_km = min(radius_km, 10.0)  # cap for performance
     cache_key = f"{round(lat,3)}_{round(lon,3)}_{round(radius_km,1)}"
 
     if cache_key in _env_cache:
