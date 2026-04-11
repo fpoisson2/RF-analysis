@@ -161,17 +161,17 @@ export const MapView = React.memo(function MapView({
 
       // 3D terrain extrusion via style (not setTerrain API)
       style.terrain = { source: 'terrain-dem', exaggeration: 1.5 };
-      // Blue daytime sky — no fog
-      style.sky = {
-        'sky-color': '#89CFF0',
-        'sky-horizon-blend': 0.3,
-        'horizon-color': '#b8ddf5',
-        'horizon-fog-blend': 0.0,
-        'fog-color': '#89CFF0',
-        'fog-ground-blend': 0.0,
-        'atmosphere-blend': 0,
-      };
+      // No sky/fog — just clean background
+      delete style.sky;
       delete style.fog;
+
+      // Summer sun lighting — casts shadows on buildings and trees
+      style.light = {
+        anchor: 'viewport',
+        color: '#fffde8',
+        intensity: 0.6,
+        position: [1.5, 210, 30],  // [radial, azimuth, polar] — sun from south-southwest, 30° elevation (summer afternoon)
+      };
 
       // --- Build complete 3D city model from CARTO vector tiles ---
       const cartoSource = Object.keys(style.sources).find(
@@ -451,7 +451,7 @@ export const MapView = React.memo(function MapView({
         zoom: 11,
         attributionControl: false,
         maxPitch: 85,
-        farZ: 100000, // unlimited view distance
+        ...(({ farZ: 100000 }) as any), // unlimited view distance
       });
 
       map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
@@ -697,8 +697,18 @@ export const MapView = React.memo(function MapView({
         setLoadMetrics(m => ({ ...m, fetch: Math.round(tFetch) }));
         console.log(`⏱ Scene fetched: ${nBldg} bldg + ${nTrees} trees (${Math.round(tFetch)}ms, ${(buf.byteLength/1e6).toFixed(1)}MB, server ${Math.round(serverMs)}ms)`);
 
-        // --- Buildings from binary ---
+        // --- Buildings + shadows from binary ---
+        // Sun direction: summer afternoon Quebec, azimuth ~210° (SSW), elevation ~45°
+        const sunAz = 210 * Math.PI / 180;
+        const sunEl = 45 * Math.PI / 180;
+        const shadowDx = Math.sin(sunAz) / Math.tan(sunEl); // lon offset per meter of height
+        const shadowDy = -Math.cos(sunAz) / Math.tan(sunEl); // lat offset
+        const mToLon = 1 / (111320 * Math.cos(lat * Math.PI / 180));
+        const mToLat = 1 / 111320;
+
         const bldgFeatures = new Array(nBldg);
+        const shadowFeatures: any[] = [];
+
         for (let i = 0; i < nBldg; i++) {
           const nVerts = view.getUint16(off, true); off += 2;
           const h = view.getFloat32(off, true); off += 4;
@@ -712,10 +722,40 @@ export const MapView = React.memo(function MapView({
           cLon /= nVerts; cLat /= nVerts;
           bldgFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
             properties: { height: h, centroid_lat: cLat, centroid_lon: cLon } };
+
+          // Shadow polygon: offset each vertex by sun projection
+          if (h > 3) {
+            const dLon = h * shadowDx * mToLon;
+            const dLat = h * shadowDy * mToLat;
+            // Shadow = union of base + offset base (simplified as offset polygon)
+            const shadowRing = new Array(nVerts);
+            for (let v = 0; v < nVerts; v++) {
+              shadowRing[v] = [ring[v][0] + dLon, ring[v][1] + dLat];
+            }
+            shadowFeatures.push({
+              type: 'Feature',
+              geometry: { type: 'Polygon', coordinates: [shadowRing] },
+              properties: {},
+            });
+          }
         }
 
         if (bldgFeatures.length > 0 && !cancelled) {
-          try { if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d'); if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source'); } catch (_) {}
+          try {
+            if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
+            if (map.getLayer('shadows')) map.removeLayer('shadows');
+            if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
+            if (map.getSource('shadows-source')) map.removeSource('shadows-source');
+          } catch (_) {}
+
+          // Ground shadows layer (rendered first, below buildings)
+          if (shadowFeatures.length > 0) {
+            map.addSource('shadows-source', { type: 'geojson', data: { type: 'FeatureCollection', features: shadowFeatures } });
+            map.addLayer({ id: 'shadows', type: 'fill', source: 'shadows-source',
+              paint: { 'fill-color': '#000000', 'fill-opacity': 0.2 } });
+          }
+
+          // Buildings with ambient occlusion
           map.addSource('buildings-3d-source', { type: 'geojson', data: { type: 'FeatureCollection', features: bldgFeatures } });
           map.addLayer({ id: 'buildings-3d', type: 'fill-extrusion', source: 'buildings-3d-source',
             paint: {
@@ -723,9 +763,9 @@ export const MapView = React.memo(function MapView({
                 ['interpolate', ['linear'], ['get', 'signal'], -120, '#461eaa', -100, '#0082d2', -90, '#00b478', -80, '#64e114', -70, '#dcf000', -60, '#ffbe00', -50, '#ff6e00', -30, '#ff1e1e'],
                 '#b0b0b0'],
               'fill-extrusion-height': ['*', ['get', 'height'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.8,
-            } });
+            } as any });
           setBuildingsLoaded(true);
-          console.log(`⏱ Buildings rendered: ${bldgFeatures.length} (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+          console.log(`⏱ Buildings + shadows rendered: ${bldgFeatures.length} bldg, ${shadowFeatures.length} shadows (${Math.round(performance.now() - loadStartRef.current)}ms)`);
         }
 
         // --- Trees: trunk + canopy ---
@@ -843,7 +883,7 @@ export const MapView = React.memo(function MapView({
 
   return (
     <div className="flex-1 relative overflow-hidden">
-      <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      <div ref={containerRef} style={{ position: 'absolute', inset: 0, backgroundColor: '#87CEEB' }} />
 
       {/* Loading overlay — hides map until all layers are loaded */}
       {!sceneReady && (
