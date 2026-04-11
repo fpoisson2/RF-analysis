@@ -161,8 +161,16 @@ export const MapView = React.memo(function MapView({
 
       // 3D terrain extrusion via style (not setTerrain API)
       style.terrain = { source: 'terrain-dem', exaggeration: 1.5 };
-      // No sky/fog — clean 3D view
-      delete style.sky;
+      // Blue daytime sky — no fog
+      style.sky = {
+        'sky-color': '#89CFF0',
+        'sky-horizon-blend': 0.3,
+        'horizon-color': '#b8ddf5',
+        'horizon-fog-blend': 0.0,
+        'fog-color': '#89CFF0',
+        'fog-ground-blend': 0.0,
+        'atmosphere-blend': 0,
+      };
       delete style.fog;
 
       // --- Build complete 3D city model from CARTO vector tiles ---
@@ -443,6 +451,7 @@ export const MapView = React.memo(function MapView({
         zoom: 11,
         attributionControl: false,
         maxPitch: 85,
+        farZ: 100000, // unlimited view distance
       });
 
       map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
