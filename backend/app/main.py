@@ -98,6 +98,13 @@ def area_coverage(req: AreaRequest):
         with open(img_path, "wb") as f:
             f.write(result["image_data"])
 
+        # Store for raster tile serving (on disk for multi-worker support)
+        import json as _json
+        with open(_COVERAGE_IMG_PATH, "wb") as cf:
+            cf.write(result["image_data"])
+        with open(_COVERAGE_META_PATH, "w") as cf:
+            _json.dump(result["bounds"], cf)
+
         elapsed = (time.time() - start) * 1000
 
         return AreaResponse(
@@ -151,6 +158,113 @@ def get_tile(filename: str):
     if not os.path.exists(path):
         raise HTTPException(404, detail="Tile not found")
     return FileResponse(path, media_type="image/png")
+
+
+# Store latest coverage for tile serving (on disk for multi-worker support)
+_COVERAGE_META_PATH = os.path.join(OUTPUT_DIR, "_coverage_meta.json")
+_COVERAGE_IMG_PATH = os.path.join(OUTPUT_DIR, "_coverage_latest.png")
+_cov_tile_cache: dict = {"img": None, "bounds": None, "mtime": 0}
+
+
+@app.get("/api/coverage/tiles/{z}/{x}/{y}.png")
+def coverage_raster_tile(z: int, x: int, y: int):
+    """Serve the latest coverage result as raster XYZ tiles.
+    Solves MapLibre image source clipping with 3D terrain."""
+    from PIL import Image as _Image
+    import io as _io
+
+    if not os.path.exists(_COVERAGE_IMG_PATH) or not os.path.exists(_COVERAGE_META_PATH):
+        raise HTTPException(404, detail="No coverage computed yet")
+
+    # Cache in memory per worker — reload only when file changes
+    mtime = os.path.getmtime(_COVERAGE_IMG_PATH)
+    if _cov_tile_cache["mtime"] != mtime or _cov_tile_cache["img"] is None:
+        import json as _json
+        from PIL import Image as _PILImg
+        _cov_tile_cache["img"] = np.array(_PILImg.open(_COVERAGE_IMG_PATH))
+        with open(_COVERAGE_META_PATH) as mf:
+            _cov_tile_cache["bounds"] = _json.load(mf)
+        _cov_tile_cache["mtime"] = mtime
+
+    src_img = _cov_tile_cache["img"]
+    bounds = _cov_tile_cache["bounds"]
+    src_h, src_w = src_img.shape[:2]
+
+    # Tile bounds (Web Mercator → WGS84)
+    n = 2 ** z
+    tile_lon_min = x / n * 360.0 - 180.0
+    tile_lon_max = (x + 1) / n * 360.0 - 180.0
+    tile_lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    tile_lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+
+    cov_n = bounds["north"]
+    cov_s = bounds["south"]
+    cov_e = bounds["east"]
+    cov_w = bounds["west"]
+
+    TILE_PX = 512
+
+    # Check overlap — return transparent tile if no overlap
+    if tile_lon_max <= cov_w or tile_lon_min >= cov_e or tile_lat_max <= cov_s or tile_lat_min >= cov_n:
+        img = _Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(buf, media_type="image/png")
+
+    # Map tile bounds to source image pixel coords
+    x0 = int((tile_lon_min - cov_w) / (cov_e - cov_w) * src_w)
+    x1 = int((tile_lon_max - cov_w) / (cov_e - cov_w) * src_w)
+    y0 = int((cov_n - tile_lat_max) / (cov_n - cov_s) * src_h)
+    y1 = int((cov_n - tile_lat_min) / (cov_n - cov_s) * src_h)
+
+    # Clamp to source image
+    x0_c = max(0, min(x0, src_w))
+    x1_c = max(0, min(x1, src_w))
+    y0_c = max(0, min(y0, src_h))
+    y1_c = max(0, min(y1, src_h))
+
+    if x1_c <= x0_c or y1_c <= y0_c or (x1 - x0) <= 0 or (y1 - y0) <= 0:
+        img = _Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(buf, media_type="image/png")
+
+    # Extract the region from source
+    region = src_img[y0_c:y1_c, x0_c:x1_c]
+
+    tile = np.zeros((TILE_PX, TILE_PX, 4), dtype=np.uint8)
+
+    total_w = x1 - x0
+    total_h = y1 - y0
+
+    dst_x0 = int((x0_c - x0) / total_w * TILE_PX)
+    dst_x1 = int((x1_c - x0) / total_w * TILE_PX)
+    dst_y0 = int((y0_c - y0) / total_h * TILE_PX)
+    dst_y1 = int((y1_c - y0) / total_h * TILE_PX)
+
+    dst_x0 = max(0, min(dst_x0, TILE_PX - 1))
+    dst_x1 = max(dst_x0 + 1, min(dst_x1, TILE_PX))
+    dst_y0 = max(0, min(dst_y0, TILE_PX - 1))
+    dst_y1 = max(dst_y0 + 1, min(dst_y1, TILE_PX))
+
+    # Resize region to fit destination using NEAREST to preserve sharp colors
+    if region.size > 0:
+        pil_region = _Image.fromarray(region)
+        pil_region = pil_region.resize((dst_x1 - dst_x0, dst_y1 - dst_y0), _Image.BILINEAR)
+        tile[dst_y0:dst_y1, dst_x0:dst_x1] = np.array(pil_region)
+
+    img = _Image.fromarray(tile, "RGBA")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf, media_type="image/png",
+                             headers={"Cache-Control": "public, max-age=300"})
 
 
 @app.get("/api/terrain/render")

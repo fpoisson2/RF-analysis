@@ -292,16 +292,30 @@ export const MapView = React.memo(function MapView({
       if (map.getSource('coverage-source')) map.removeSource('coverage-source');
 
       const { north, south, east, west } = coverageResult.bounds;
+      // Use raster tiles instead of image source to avoid 3D terrain clipping
+      // Calculate optimal maxzoom from coverage resolution
+      // At maxzoom, MapLibre will oversample for higher zooms (consistent quality)
+      const covWidthDeg = east - west;
+      const covPixels = coverageResult.stats?.grid_size || 666;
+      const pixelDeg = covWidthDeg / covPixels;
+      // Each zoom level tile covers 360/2^z degrees. We want ~1 source pixel per tile pixel.
+      // tile_deg = 360 / 2^z, pixels_per_tile = tile_deg / pixelDeg
+      // We want pixels_per_tile >= 512, so z <= log2(360 / (pixelDeg * 512))
+      const optimalMaxZoom = Math.min(15, Math.max(10, Math.floor(Math.log2(360 / (pixelDeg * 512)))));
+
       map.addSource('coverage-source', {
-        type: 'image',
-        url: coverageResult.image_url,
-        coordinates: [[west, north], [east, north], [east, south], [west, south]],
+        type: 'raster',
+        tiles: [window.location.origin + '/api/coverage/tiles/{z}/{x}/{y}.png'],
+        tileSize: 512,
+        bounds: [west, south, east, north],
+        minzoom: 8,
+        maxzoom: optimalMaxZoom,
       });
       map.addLayer({
         id: 'coverage-layer',
         type: 'raster',
         source: 'coverage-source',
-        paint: { 'raster-opacity': 0.55 },
+        paint: { 'raster-opacity': 0.55, 'raster-fade-duration': 0, 'raster-resampling': 'linear' },
       });
     };
 
@@ -399,7 +413,12 @@ export const MapView = React.memo(function MapView({
           .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
           .map((f: any) => {
             const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
-            return { ...f, properties: { ...f.properties, height: h } };
+            const ring = f.geometry.type === 'Polygon'
+              ? f.geometry.coordinates[0]
+              : f.geometry.coordinates[0][0];
+            const cLat = ring.reduce((s: number, p: number[]) => s + p[1], 0) / ring.length;
+            const cLon = ring.reduce((s: number, p: number[]) => s + p[0], 0) / ring.length;
+            return { ...f, properties: { ...f.properties, height: h, centroid_lat: cLat, centroid_lon: cLon } };
           });
 
         if (cancelled || features.length === 0) return;
@@ -419,10 +438,25 @@ export const MapView = React.memo(function MapView({
           source: 'buildings-3d-source',
           minzoom: 11,
           paint: {
-            'fill-extrusion-color': '#b0b0b0',
+            'fill-extrusion-color': [
+              'case',
+              ['==', ['typeof', ['get', 'signal']] as any, 'number'],
+              [
+                'interpolate', ['linear'], ['get', 'signal'],
+                -120, '#461eaa',
+                -100, '#0082d2',
+                -90,  '#00b478',
+                -80,  '#64e114',
+                -70,  '#dcf000',
+                -60,  '#ffbe00',
+                -50,  '#ff6e00',
+                -30,  '#ff1e1e',
+              ],
+              '#b0b0b0',
+            ],
             'fill-extrusion-height': ['get', 'height'],
             'fill-extrusion-base': 0,
-            'fill-extrusion-opacity': 0.7,
+            'fill-extrusion-opacity': 0.8,
           },
         });
         setBuildingsLoaded(true);
@@ -437,6 +471,73 @@ export const MapView = React.memo(function MapView({
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [txPosition[0], txPosition[1], radius, mapReady]);
+
+  // Color buildings based on coverage signal
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !coverageResult) return;
+    const src = map.getSource('buildings-3d-source') as any;
+    if (!src?._data?.features) return;
+
+    let cancelled = false;
+    const features = src._data.features;
+    const { north, south, east, west } = coverageResult.bounds;
+
+    // Load the coverage image and sample pixel colors → signal values
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, img.width, img.height);
+      const pixels = imageData.data;
+
+      // Sample signal at each building centroid from the coverage image
+      let updated = 0;
+      for (const f of features) {
+        const clat = f.properties.centroid_lat;
+        const clon = f.properties.centroid_lon;
+        if (!clat || !clon) continue;
+
+        // Map lat/lon to pixel coords
+        const px = Math.floor((clon - west) / (east - west) * img.width);
+        const py = Math.floor((north - clat) / (north - south) * img.height);
+
+        if (px < 0 || px >= img.width || py < 0 || py >= img.height) {
+          f.properties.signal = null;
+          continue;
+        }
+
+        const idx = (py * img.width + px) * 4;
+        const a = pixels[idx + 3];
+        if (a < 10) {
+          f.properties.signal = null;
+          continue;
+        }
+
+        // Reverse the color → signal mapping (approximate from heatmap colors)
+        const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2];
+        // Red=strong, blue=weak. Use weighted luminance as proxy.
+        // Map: red (#ff1e1e) → -30, blue (#461eaa) → -120
+        const warmth = (r * 2 - b * 1.5 + g * 0.3) / 255;
+        const signal = -120 + warmth * 90; // rough mapping
+        f.properties.signal = Math.max(-130, Math.min(-20, signal));
+        updated++;
+      }
+
+      if (!cancelled && updated > 0) {
+        src.setData({ type: 'FeatureCollection', features });
+        console.log(`Buildings colored: ${updated} with signal`);
+      }
+    };
+    img.src = coverageResult.image_url;
+
+    return () => { cancelled = true; };
+  }, [coverageResult]);
 
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];

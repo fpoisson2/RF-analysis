@@ -256,15 +256,44 @@ class CoverageEngine:
 
                 # Fill NaN (areas outside LiDAR coverage) with SRTM
                 nan_mask = np.isnan(base_grid)
-                if np.any(nan_mask):
-                    # NaN pixels filled using SRTM fallback below
+                if np.any(nan_mask) and hasattr(self.terrain, 'fallback') and self.terrain.fallback:
+                    fb = self.terrain.fallback
                     t_h, t_w = base_grid.shape
                     t_lats = np.linspace(lat_max, lat_min, t_h)
                     t_lons = np.linspace(lon_min, lon_max, t_w)
-                    nan_rows, nan_cols = np.where(nan_mask)
-                    for r, c in zip(nan_rows, nan_cols):
-                        base_grid[r, c] = self.terrain.fallback.get_elevation(
-                            t_lats[r], t_lons[c]) if hasattr(self.terrain, 'fallback') else 0.0
+
+                    # Vectorized SRTM fill (same logic as _srtm_block_read)
+                    lon_grid_f, lat_grid_f = np.meshgrid(t_lons, t_lats)
+                    tile_lat_f = np.floor(lat_grid_f).astype(int)
+                    tile_lon_f = np.floor(lon_grid_f).astype(int)
+                    unique_tiles = set(zip(tile_lat_f[nan_mask], tile_lon_f[nan_mask]))
+
+                    for (tlat, tlon) in unique_tiles:
+                        t = fb._get_tile(tlat, tlon)
+                        if t is None:
+                            continue
+                        data, sz = t
+                        tmask = nan_mask & (tile_lat_f == tlat) & (tile_lon_f == tlon)
+                        if not np.any(tmask):
+                            continue
+                        lat_frac = lat_grid_f[tmask] - tlat
+                        lon_frac = lon_grid_f[tmask] - tlon
+                        row = (1.0 - lat_frac) * (sz - 1)
+                        col = lon_frac * (sz - 1)
+                        r0 = np.clip(np.floor(row).astype(int), 0, sz - 1)
+                        c0 = np.clip(np.floor(col).astype(int), 0, sz - 1)
+                        r1 = np.clip(r0 + 1, 0, sz - 1)
+                        c1 = np.clip(c0 + 1, 0, sz - 1)
+                        dr = row - r0
+                        dc = col - c0
+                        z = (data[r0, c0] * (1 - dr) * (1 - dc) +
+                             data[r0, c1] * (1 - dr) * dc +
+                             data[r1, c0] * dr * (1 - dc) +
+                             data[r1, c1] * dr * dc).astype(np.float32)
+                        z[z <= -32768] = 0.0
+                        z = np.maximum(z, 0.0)
+                        base_grid[tmask] = z
+
                 base_grid = np.nan_to_num(base_grid, nan=0.0)
 
                 # Try to also read MHC (canopy + buildings) at same shape
