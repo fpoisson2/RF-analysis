@@ -47,12 +47,20 @@ app = FastAPI(
     description="Open-source RF planning tool - alternative to CloudRF",
 )
 
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _startup_index():
+    """Pre-index buildings at startup for fast MVT tile serving."""
+    _ensure_buildings_indexed()
 
 
 @app.get("/api/health")
@@ -280,88 +288,105 @@ def render_terrain(lat: float, lon: float, radius_km: float = 2.0,
 
 
 def _srtm_block_read(srtm_mgr, lat_min, lon_min, lat_max, lon_max, out_size):
-    """Fast SRTM block read: slice HGT arrays directly instead of point-by-point."""
-    from PIL import Image as _Img
+    """Fast SRTM block read with bilinear interpolation on the raw grid.
+    Guarantees consistent values at tile edges because sampling is deterministic
+    for a given lat/lon regardless of which DEM tile requests it."""
 
-    # Collect unique tiles needed
-    lat_tiles = range(math.floor(lat_min), math.floor(lat_max) + 1)
-    lon_tiles = range(math.floor(lon_min), math.floor(lon_max) + 1)
+    # Generate exact lat/lon for each output pixel
+    lats = np.linspace(lat_max, lat_min, out_size)  # top to bottom
+    lons = np.linspace(lon_min, lon_max, out_size)
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-    # Build a merged grid covering the full extent
-    rows_total = 0
-    cols_total = 0
-    tile_data = {}
-    tile_size = None
+    output = np.zeros((out_size, out_size), dtype=np.float32)
 
-    for tlat in lat_tiles:
-        for tlon in lon_tiles:
-            t = srtm_mgr._get_tile(tlat, tlon)
-            if t is not None:
-                data, sz = t
-                tile_data[(tlat, tlon)] = data
-                tile_size = sz
-            else:
-                tile_data[(tlat, tlon)] = None
+    # Group pixels by SRTM tile
+    tile_lat = np.floor(lat_grid).astype(int)
+    tile_lon = np.floor(lon_grid).astype(int)
 
-    if tile_size is None:
-        # No SRTM data at all — return flat grid
-        return np.zeros((out_size, out_size), dtype=np.float32)
+    # Find unique tiles needed
+    unique_tiles = set(zip(tile_lat.ravel(), tile_lon.ravel()))
 
-    n_lat = len(lat_tiles)
-    n_lon = len(lon_tiles)
-    merged = np.zeros((n_lat * tile_size, n_lon * tile_size), dtype=np.float32)
+    for (tlat, tlon) in unique_tiles:
+        t = srtm_mgr._get_tile(tlat, tlon)
+        if t is None:
+            continue
+        data, sz = t
 
-    sorted_lats = sorted(lat_tiles, reverse=True)  # top (north) first
-    sorted_lons = sorted(lon_tiles)
+        # Mask of pixels belonging to this tile
+        mask = (tile_lat == tlat) & (tile_lon == tlon)
+        if not np.any(mask):
+            continue
 
-    for ri, tlat in enumerate(sorted_lats):
-        for ci, tlon in enumerate(sorted_lons):
-            d = tile_data.get((tlat, tlon))
-            if d is not None:
-                merged[ri * tile_size:(ri + 1) * tile_size,
-                       ci * tile_size:(ci + 1) * tile_size] = d
+        # Fractional position within tile
+        lat_frac = lat_grid[mask] - tlat
+        lon_frac = lon_grid[mask] - tlon
 
-    # Map pixel coords for the requested extent
-    total_lat_max = max(sorted_lats) + 1
-    total_lon_min = min(sorted_lons)
-    total_lat_min = min(sorted_lats)
-    total_lon_max = max(sorted_lons) + 1
+        # Pixel coordinates (SRTM: row 0 = north edge of tile = lat+1)
+        row = (1.0 - lat_frac) * (sz - 1)
+        col = lon_frac * (sz - 1)
 
-    # Row/col in merged array
-    r_start = int((total_lat_max - lat_max) / (total_lat_max - total_lat_min) * merged.shape[0])
-    r_end = int((total_lat_max - lat_min) / (total_lat_max - total_lat_min) * merged.shape[0])
-    c_start = int((lon_min - total_lon_min) / (total_lon_max - total_lon_min) * merged.shape[1])
-    c_end = int((lon_max - total_lon_min) / (total_lon_max - total_lon_min) * merged.shape[1])
+        r0 = np.clip(np.floor(row).astype(int), 0, sz - 1)
+        c0 = np.clip(np.floor(col).astype(int), 0, sz - 1)
+        r1 = np.clip(r0 + 1, 0, sz - 1)
+        c1 = np.clip(c0 + 1, 0, sz - 1)
 
-    r_start = max(0, min(r_start, merged.shape[0] - 1))
-    r_end = max(r_start + 1, min(r_end, merged.shape[0]))
-    c_start = max(0, min(c_start, merged.shape[1] - 1))
-    c_end = max(c_start + 1, min(c_end, merged.shape[1]))
+        dr = row - r0
+        dc = col - c0
 
-    block = merged[r_start:r_end, c_start:c_end]
-    block[block <= -32768] = 0.0
+        # Bilinear interpolation
+        z00 = data[r0, c0].astype(np.float32)
+        z01 = data[r0, c1].astype(np.float32)
+        z10 = data[r1, c0].astype(np.float32)
+        z11 = data[r1, c1].astype(np.float32)
 
-    # Resize to output size
-    if block.shape[0] != out_size or block.shape[1] != out_size:
-        img = _Img.fromarray(block)
-        img = img.resize((out_size, out_size), _Img.BILINEAR)
-        block = np.array(img, dtype=np.float32)
+        # Handle voids
+        void_mask = (z00 <= -32768) | (z01 <= -32768) | (z10 <= -32768) | (z11 <= -32768)
 
-    return block
+        z = (z00 * (1 - dr) * (1 - dc) +
+             z01 * (1 - dr) * dc +
+             z10 * dr * (1 - dc) +
+             z11 * dr * dc)
 
+        z[void_mask] = 0.0
+        z = np.maximum(z, 0.0)
+
+        output[mask] = z
+
+    return output
+
+
+DEM_CACHE_DIR = os.path.join(OUTPUT_DIR, "dem_cache")
+os.makedirs(DEM_CACHE_DIR, exist_ok=True)
 
 @app.get("/api/terrain/dem/{z}/{x}/{y}.png")
 def terrain_dem_tile(z: int, x: int, y: int, mode: str = "terrain"):
     """
     Serve raster-dem tiles in Mapbox Terrain-RGB encoding for MapLibre setTerrain().
-    Uses LiDAR (MNS/MNT) with SRTM fallback.
-    mode: 'terrain' (DTM ground), 'surface' (DSM ground+canopy)
+    Uses LiDAR (MNS/MNT) with SRTM fallback. Cached to disk.
     Encoding: elevation = -10000 + (R*256*256 + G*256 + B) * 0.1
     """
     import io as _io
     from PIL import Image as _Image
 
+    # Check disk cache first (validate file is a real PNG > 1KB)
+    cache_path = os.path.join(DEM_CACHE_DIR, f"{z}_{x}_{y}_{mode}.png")
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
+        return FileResponse(cache_path, media_type="image/png",
+                           headers={"Cache-Control": "public, max-age=86400"})
+
     tile_size = 256
+
+    try:
+        return _generate_dem_tile(z, x, y, mode, tile_size, cache_path)
+    except Exception as e:
+        logger.warning(f"DEM tile {z}/{x}/{y} failed: {e}")
+        # Return 404 — MapLibre will upsample from parent tile instead of showing a hole
+        raise HTTPException(status_code=404, detail="DEM tile generation failed")
+
+
+def _generate_dem_tile(z, x, y, mode, tile_size, cache_path):
+    import io as _io
+    from PIL import Image as _Image
 
     # Tile bounds (Web Mercator → WGS84)
     n = 2 ** z
@@ -372,30 +397,35 @@ def terrain_dem_tile(z: int, x: int, y: int, mode: str = "terrain"):
 
     use_canopy = mode == "surface"
 
-    # Try LiDAR block read first (fast)
-    ds_type = "mnt"
-    grid = None
+    # Always get SRTM as base layer (padded for seamless edges)
+    grid = _srtm_block_read(srtm, lat_min, lon_min, lat_max, lon_max, tile_size)
+
+    # Overlay LiDAR where available
     if hasattr(terrain, 'read_block'):
         block = terrain.read_block(lat_min, lon_min, lat_max, lon_max,
-                                    dataset_type=ds_type, max_pixels=tile_size)
+                                    dataset_type="mnt", max_pixels=tile_size)
         if block is not None:
-            grid = block[0]
+            lidar_grid = block[0]
             if use_canopy:
                 canopy_block = terrain.read_block(lat_min, lon_min, lat_max, lon_max,
                                                    dataset_type="mhc", max_pixels=tile_size)
                 if canopy_block is not None:
                     cb = canopy_block[0]
-                    if cb.shape != grid.shape:
+                    if cb.shape != lidar_grid.shape:
                         cb_img = _Image.fromarray(cb)
-                        cb_img = cb_img.resize((grid.shape[1], grid.shape[0]), _Image.BILINEAR)
+                        cb_img = cb_img.resize((lidar_grid.shape[1], lidar_grid.shape[0]), _Image.BILINEAR)
                         cb = np.array(cb_img)
-                    grid = grid + np.maximum(cb, 0)
+                    lidar_grid = lidar_grid + np.maximum(cb, 0)
 
-    # Fallback: SRTM direct array slicing (fast)
-    if grid is None:
-        grid = _srtm_block_read(srtm, lat_min, lon_min, lat_max, lon_max, tile_size)
+            if lidar_grid.shape != grid.shape:
+                lidar_img = _Image.fromarray(lidar_grid)
+                lidar_img = lidar_img.resize((grid.shape[1], grid.shape[0]), _Image.BILINEAR)
+                lidar_grid = np.array(lidar_img, dtype=np.float32)
 
-    # Resize to tile_size if needed
+            valid = ~np.isnan(lidar_grid) & (lidar_grid > -100)
+            grid[valid] = lidar_grid[valid]
+
+    # Resize padded grid to tile_size, then crop to tile_size
     if grid.shape[0] != tile_size or grid.shape[1] != tile_size:
         img_tmp = _Image.fromarray(grid)
         img_tmp = img_tmp.resize((tile_size, tile_size), _Image.BILINEAR)
@@ -413,13 +443,10 @@ def terrain_dem_tile(z: int, x: int, y: int, mode: str = "terrain"):
     image = np.stack([r_ch, g_ch, b_ch], axis=-1).astype(np.uint8)
 
     img = _Image.fromarray(image, "RGB")
-    buf = _io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
+    img.save(cache_path, format="PNG")
 
-    from fastapi.responses import StreamingResponse
-    return StreamingResponse(buf, media_type="image/png",
-                             headers={"Cache-Control": "public, max-age=86400"})
+    return FileResponse(cache_path, media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/elevation")
@@ -478,16 +505,389 @@ def download_quebec_city_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/data/buildings")
-def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
-    """Get building footprints near a point (from downloaded data)."""
+def _fetch_osm_buildings(lat, lon, radius_km):
+    """Fetch building footprints from OpenStreetMap Overpass API."""
+    import urllib.request, urllib.parse, json as _json
+    half_lat = radius_km / 111.32
+    cos_lat = math.cos(math.radians(lat))
+    half_lon = radius_km / (111.32 * cos_lat)
+    bbox = f"{lat-half_lat},{lon-half_lon},{lat+half_lat},{lon+half_lon}"
+    query = f'[out:json][timeout:30];(way["building"]({bbox});relation["building"]({bbox}););(._;>;);out body;'
+    url = 'https://overpass-api.de/api/interpreter'
+    try:
+        req = urllib.request.Request(url, data=f'data={urllib.parse.quote(query)}'.encode(),
+                                     headers={"User-Agent": "RF-Planner/1.0"})
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = _json.loads(resp.read())
+    except Exception as e:
+        logger.warning(f"OSM Overpass failed: {e}")
+        return []
+
+    # Build node index
+    nodes = {}
+    for el in data.get("elements", []):
+        if el["type"] == "node":
+            nodes[el["id"]] = (el["lon"], el["lat"])
+
+    # Also build way geometry index for relations
+    ways = {}
+    for el in data.get("elements", []):
+        if el["type"] == "way":
+            nds = el.get("nodes", [])
+            coords = [nodes[n] for n in nds if n in nodes]
+            if coords:
+                ways[el["id"]] = coords
+
+    def _extract_height(tags):
+        height = None
+        if "height" in tags:
+            try: height = float(tags["height"].replace("m", "").strip())
+            except: pass
+        if height is None and "building:levels" in tags:
+            try: height = float(tags["building:levels"]) * 3.5
+            except: pass
+        return height
+
+    def _make_feature(el_id, tags, rings):
+        if not rings:
+            return None
+        # Use outer ring(s)
+        if len(rings) == 1:
+            geom = {"type": "Polygon", "coordinates": [rings[0]]}
+        else:
+            geom = {"type": "MultiPolygon", "coordinates": [[r] for r in rings]}
+        return {
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "ID": f"osm_{el_id}",
+                "SOURCE_CAPTAGE": "OpenStreetMap",
+                "TYPE_BATIMENT": tags.get("building", "yes"),
+                "_height": _extract_height(tags),
+                "name": tags.get("name"),
+            },
+        }
+
+    features = []
+    for el in data.get("elements", []):
+        if el["type"] == "way":
+            tags = el.get("tags", {})
+            if "building" not in tags:
+                continue
+            nds = el.get("nodes", [])
+            coords = [nodes[n] for n in nds if n in nodes]
+            if len(coords) < 4:
+                continue
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            feat = _make_feature(el["id"], tags, [coords])
+            if feat:
+                features.append(feat)
+
+        elif el["type"] == "relation":
+            tags = el.get("tags", {})
+            if "building" not in tags:
+                continue
+            # Collect outer rings from relation members
+            outer_rings = []
+            for member in el.get("members", []):
+                if member.get("type") == "way" and member.get("role", "outer") == "outer":
+                    wid = member["ref"]
+                    if wid in ways:
+                        ring = ways[wid]
+                        if len(ring) >= 4:
+                            if ring[0] != ring[-1]:
+                                ring.append(ring[0])
+                            outer_rings.append(ring)
+            feat = _make_feature(el["id"], tags, outer_rings)
+            if feat:
+                features.append(feat)
+
+    return features
+
+
+# Cache for OSM buildings (key: rounded lat/lon/radius)
+_osm_cache: dict = {}
+
+# Cache for local buildings file (loaded once into memory)
+_local_buildings_cache: dict = {"data": None}
+
+BUILDINGS_CACHE_DIR = os.path.join(OUTPUT_DIR, "buildings_cache")
+BUILDINGS_MVT_CACHE = os.path.join(OUTPUT_DIR, "buildings_mvt")
+os.makedirs(BUILDINGS_MVT_CACHE, exist_ok=True)
+
+# Pre-indexed buildings for vector tile serving
+_buildings_spatial_index: dict = {"features": None, "grid": None, "loaded": False}
+_GRID_RES = 0.01  # ~1km grid cells for spatial index
+
+
+def _ensure_buildings_indexed():
+    """Load and spatially index all buildings for fast MVT tile generation."""
+    if _buildings_spatial_index["loaded"]:
+        return _buildings_spatial_index["features"]
+
+    import json as _json
+    features = []
+    buildings_path = os.path.join(DATA_DIR, "buildings", "quebec_city_batiments.geojson")
+    if os.path.exists(buildings_path):
+        logger.info("Indexing buildings for MVT serving...")
+        with open(buildings_path) as f:
+            data = _json.load(f)
+        for feat in data.get("features", []):
+            geom = feat.get("geometry")
+            if not geom:
+                continue
+            coords = geom.get("coordinates", [])
+            try:
+                if geom["type"] == "Polygon":
+                    ring = coords[0]
+                elif geom["type"] == "MultiPolygon":
+                    ring = coords[0][0]
+                else:
+                    continue
+                clat = sum(p[1] for p in ring) / len(ring)
+                clon = sum(p[0] for p in ring) / len(ring)
+
+                props = feat.get("properties", {})
+                # Pre-compute height
+                height = 8.0
+                btype = (props.get("TYPE_BATIMENT") or "").lower()
+                if "commercial" in btype or "industriel" in btype:
+                    height = 12.0
+                elif "public" in btype or "institutionnel" in btype or "municipal" in btype:
+                    height = 15.0
+                elif "école" in btype or "ecole" in btype:
+                    height = 12.0
+                elif "église" in btype or "eglise" in btype:
+                    height = 20.0
+                elif "hôpital" in btype or "hopital" in btype:
+                    height = 20.0
+
+                features.append({
+                    "geometry": geom,
+                    "properties": {"h": height, "t": props.get("TYPE_BATIMENT", "")},
+                    "clat": clat,
+                    "clon": clon,
+                })
+            except (IndexError, KeyError, TypeError):
+                continue
+
+        logger.info(f"Indexed {len(features)} buildings for MVT")
+
+    # Build spatial grid index for fast tile lookups
+    from collections import defaultdict
+    grid = defaultdict(list)
+    for i, feat in enumerate(features):
+        gkey = (int(feat["clat"] / _GRID_RES), int(feat["clon"] / _GRID_RES))
+        grid[gkey].append(i)
+    logger.info(f"Spatial grid: {len(grid)} cells")
+
+    _buildings_spatial_index["features"] = features
+    _buildings_spatial_index["grid"] = dict(grid)
+    _buildings_spatial_index["loaded"] = True
+    return features
+
+
+@app.get("/api/buildings/tiles/{z}/{x}/{y}.pbf")
+def buildings_vector_tile(z: int, x: int, y: int):
+    """Serve buildings as Mapbox Vector Tiles for efficient GPU rendering."""
+    import mapbox_vector_tile as mvt
+    from fastapi.responses import Response
+
+    # Check cache
+    cache_path = os.path.join(BUILDINGS_MVT_CACHE, f"{z}_{x}_{y}.pbf")
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return Response(
+            content=open(cache_path, "rb").read(),
+            media_type="application/x-protobuf",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    # Tile bounds
+    n = 2 ** z
+    lon_min = x / n * 360.0 - 180.0
+    lon_max = (x + 1) / n * 360.0 - 180.0
+    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+
+    # Small buffer for edge features
+    buf_lat = (lat_max - lat_min) * 0.05
+    buf_lon = (lon_max - lon_min) * 0.05
+
+    all_features = _ensure_buildings_indexed()
+    grid = _buildings_spatial_index.get("grid", {})
+    if not all_features:
+        return Response(content=b"", media_type="application/x-protobuf")
+
+    # Use spatial grid for fast lookup
+    lat_min_g = int((lat_min - buf_lat) / _GRID_RES)
+    lat_max_g = int((lat_max + buf_lat) / _GRID_RES) + 1
+    lon_min_g = int((lon_min - buf_lon) / _GRID_RES)
+    lon_max_g = int((lon_max + buf_lon) / _GRID_RES) + 1
+
+    candidate_indices = set()
+    for glat in range(lat_min_g, lat_max_g + 1):
+        for glon in range(lon_min_g, lon_max_g + 1):
+            candidate_indices.update(grid.get((glat, glon), []))
+
+    tile_features = []
+    for idx in candidate_indices:
+        feat = all_features[idx]
+        if (lat_min - buf_lat <= feat["clat"] <= lat_max + buf_lat and
+            lon_min - buf_lon <= feat["clon"] <= lon_max + buf_lon):
+            tile_features.append({
+                "geometry": feat["geometry"],
+                "properties": feat["properties"],
+            })
+
+    if not tile_features:
+        # Empty tile
+        content = mvt.encode([{"name": "buildings", "features": []}],
+                             quantize_bounds=(lon_min, lat_min, lon_max, lat_max))
+    else:
+        mvt_features = []
+        for f in tile_features:
+            mvt_features.append({
+                "geometry": f["geometry"],
+                "properties": f["properties"],
+            })
+
+        content = mvt.encode(
+            [{"name": "buildings", "features": mvt_features}],
+            quantize_bounds=(lon_min, lat_min, lon_max, lat_max),
+        )
+
+    # Cache
+    with open(cache_path, "wb") as fout:
+        fout.write(content)
+
+    return Response(
+        content=content,
+        media_type="application/x-protobuf",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+os.makedirs(BUILDINGS_CACHE_DIR, exist_ok=True)
+
+
+def _load_local_buildings():
+    """Load local buildings file once into memory."""
+    if _local_buildings_cache["data"] is not None:
+        return _local_buildings_cache["data"]
     import json
     buildings_path = os.path.join(DATA_DIR, "buildings", "quebec_city_batiments.geojson")
-    if not os.path.exists(buildings_path):
-        raise HTTPException(404, detail="Buildings data not downloaded. POST /api/data/download/quebec-city first.")
+    if os.path.exists(buildings_path):
+        logger.info("Loading local buildings file into memory...")
+        with open(buildings_path) as f:
+            _local_buildings_cache["data"] = json.load(f)
+        logger.info(f"Loaded {len(_local_buildings_cache['data'].get('features', []))} buildings")
+    else:
+        _local_buildings_cache["data"] = {"features": []}
+    return _local_buildings_cache["data"]
 
-    with open(buildings_path) as f:
-        data = json.load(f)
+
+@app.get("/api/data/buildings")
+def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
+    """Get building footprints near a point (local data + OSM). Cached to disk."""
+    import json
+
+    # Check disk cache first (key: rounded position + radius)
+    cache_key_str = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
+    cache_path = os.path.join(BUILDINGS_CACHE_DIR, f"buildings_{cache_key_str}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return json.load(f)
+
+    local_data = _load_local_buildings()
+
+    # Also fetch OSM buildings (cached, max 3km to avoid Overpass timeout)
+    osm_radius = min(radius_km, 3.0)
+    cache_key = (round(lat, 2), round(lon, 2), round(osm_radius))
+    if cache_key not in _osm_cache:
+        _osm_cache[cache_key] = _fetch_osm_buildings(lat, lon, osm_radius)
+        # Keep cache small
+        if len(_osm_cache) > 20:
+            oldest = next(iter(_osm_cache))
+            del _osm_cache[oldest]
+
+    osm_features = _osm_cache.get(cache_key, [])
+
+    # Deduplicate: remove local buildings whose centroid is inside any OSM bounding box
+    # Build list of OSM bounding boxes
+    osm_bboxes = []
+    for f in osm_features:
+        g = f.get("geometry")
+        if not g:
+            continue
+        try:
+            all_pts = []
+            if g["type"] == "Polygon":
+                all_pts = g["coordinates"][0]
+            elif g["type"] == "MultiPolygon":
+                for poly in g["coordinates"]:
+                    all_pts.extend(poly[0])
+            if all_pts:
+                lats_r = [p[1] for p in all_pts]
+                lons_r = [p[0] for p in all_pts]
+                osm_bboxes.append((min(lats_r), max(lats_r), min(lons_r), max(lons_r)))
+        except (IndexError, KeyError):
+            pass
+
+    # Also collect OSM centroids for proximity-based dedup
+    osm_centroids = []
+    for f in osm_features:
+        g = f.get("geometry")
+        if not g:
+            continue
+        try:
+            all_pts = []
+            if g["type"] == "Polygon":
+                all_pts = g["coordinates"][0]
+            elif g["type"] == "MultiPolygon":
+                for poly in g["coordinates"]:
+                    all_pts.extend(poly[0])
+            if all_pts:
+                osm_centroids.append((
+                    sum(p[1] for p in all_pts) / len(all_pts),
+                    sum(p[0] for p in all_pts) / len(all_pts),
+                ))
+        except (IndexError, KeyError):
+            pass
+
+    def _in_any_osm_bbox(clat, clon):
+        # Check bounding box overlap
+        for lat_lo, lat_hi, lon_lo, lon_hi in osm_bboxes:
+            if lat_lo <= clat <= lat_hi and lon_lo <= clon <= lon_hi:
+                return True
+        # Check proximity to OSM centroid (~20m threshold)
+        threshold = 0.0002  # ~22m
+        for olat, olon in osm_centroids:
+            if abs(clat - olat) < threshold and abs(clon - olon) < threshold:
+                return True
+        return False
+
+    deduped_local = []
+    for f in local_data.get("features", []):
+        g = f.get("geometry")
+        if not g:
+            continue
+        coords = g.get("coordinates", [])
+        try:
+            if g["type"] == "Polygon":
+                ring = coords[0]
+            elif g["type"] == "MultiPolygon":
+                ring = coords[0][0]
+            else:
+                deduped_local.append(f)
+                continue
+            clat = sum(p[1] for p in ring) / len(ring)
+            clon = sum(p[0] for p in ring) / len(ring)
+            if not _in_any_osm_bbox(clat, clon):
+                deduped_local.append(f)
+        except (IndexError, KeyError):
+            deduped_local.append(f)
+
+    # OSM first (better heights/names), then local to fill gaps
+    data = {"features": osm_features + deduped_local}
 
     # Filter buildings within radius
     import math
@@ -516,15 +916,17 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         except (IndexError, KeyError, TypeError):
             continue
 
-    # Pass 2: batch LiDAR height lookup via block read
+    # Pass 2: batch LiDAR height lookup via block read (only within 5km for perf)
     mhc_grid = None
     mhc_meta = None
+    lidar_radius = min(radius_km, 5.0)
+    lidar_lat_range = lidar_radius / 111.32
+    lidar_lon_range = lidar_radius / (111.32 * cos_lat)
     if candidates and hasattr(terrain, 'read_block'):
-        all_lats = [c[1] for c in candidates]
-        all_lons = [c[2] for c in candidates]
-        blk_lat_min, blk_lat_max = min(all_lats), max(all_lats)
-        blk_lon_min, blk_lon_max = min(all_lons), max(all_lons)
-        # Add small padding
+        blk_lat_min = lat - lidar_lat_range
+        blk_lat_max = lat + lidar_lat_range
+        blk_lon_min = lon - lidar_lon_range
+        blk_lon_max = lon + lidar_lon_range
         pad = 0.001
         try:
             block = terrain.read_block(blk_lat_min - pad, blk_lon_min - pad,
@@ -535,21 +937,47 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         except Exception:
             pass
 
-    def _sample_mhc(clat, clon):
-        """Sample canopy height from block-read grid."""
+    def _to_rc(lat_pt, lon_pt):
+        """Convert lat/lon to row/col in the MHC grid."""
         if mhc_grid is None or mhc_meta is None:
-            return None
+            return None, None
         lat_min_b = mhc_meta.get("lat_min", mhc_meta.get("south", 0))
         lat_max_b = mhc_meta.get("lat_max", mhc_meta.get("north", 0))
         lon_min_b = mhc_meta.get("lon_min", mhc_meta.get("west", 0))
         lon_max_b = mhc_meta.get("lon_max", mhc_meta.get("east", 0))
         if lat_max_b <= lat_min_b or lon_max_b <= lon_min_b:
-            return None
-        r = int((lat_max_b - clat) / (lat_max_b - lat_min_b) * mhc_grid.shape[0])
-        c = int((clon - lon_min_b) / (lon_max_b - lon_min_b) * mhc_grid.shape[1])
+            return None, None
+        r = int((lat_max_b - lat_pt) / (lat_max_b - lat_min_b) * mhc_grid.shape[0])
+        c = int((lon_pt - lon_min_b) / (lon_max_b - lon_min_b) * mhc_grid.shape[1])
         r = max(0, min(r, mhc_grid.shape[0] - 1))
         c = max(0, min(c, mhc_grid.shape[1] - 1))
-        val = float(mhc_grid[r, c])
+        return r, c
+
+    def _sample_mhc_polygon(ring):
+        """Sample canopy height across a building polygon footprint.
+        Uses 90th percentile instead of max to avoid picking up
+        adjacent tall structures that bleed into the bounding box."""
+        if mhc_grid is None:
+            return None
+        # Get bounding box of polygon in grid coords
+        rows, cols = [], []
+        for pt in ring:
+            r, c = _to_rc(pt[1], pt[0])
+            if r is not None:
+                rows.append(r)
+                cols.append(c)
+        if not rows:
+            return None
+        r_min, r_max = max(0, min(rows)), min(mhc_grid.shape[0] - 1, max(rows))
+        c_min, c_max = max(0, min(cols)), min(mhc_grid.shape[1] - 1, max(cols))
+        block = mhc_grid[r_min:r_max + 1, c_min:c_max + 1]
+        if block.size == 0:
+            return None
+        valid = block[block > 2.0]
+        if len(valid) == 0:
+            return None
+        # Use median — resistant to tall neighbor bleed in the bounding box
+        val = float(np.median(valid))
         return val if val > 2.0 else None
 
     # Pass 3: assign heights
@@ -568,9 +996,12 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
                 except (ValueError, TypeError):
                     pass
 
-        # Try LiDAR canopy height
+        # Try LiDAR canopy height — sample max across polygon footprint
         if height is None:
-            lidar_h = _sample_mhc(clat, clon)
+            geom = feature["geometry"]
+            coords = geom["coordinates"]
+            ring = coords[0] if geom["type"] == "Polygon" else coords[0][0]
+            lidar_h = _sample_mhc_polygon(ring)
             if lidar_h is not None:
                 height = round(lidar_h, 1)
 
@@ -590,8 +1021,19 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
             "properties": {**props, "_height": height},
         })
 
-    return {
+    result = {
         "type": "FeatureCollection",
-        "features": filtered[:25000],  # Limit for performance
+        "features": filtered,
         "total_in_area": len(filtered),
     }
+
+    # Save to disk cache for instant loading next time
+    try:
+        import json as _json
+        with open(cache_path, 'w') as f:
+            _json.dump(result, f)
+        logger.info(f"Buildings cached: {cache_path} ({len(filtered)} features)")
+    except Exception as e:
+        logger.warning(f"Failed to cache buildings: {e}")
+
+    return result
