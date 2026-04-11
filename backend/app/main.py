@@ -155,10 +155,13 @@ def coverage_sample(data: dict):
         return {"values": [None] * len(points)}
 
     n = grid.shape[0]
-    lat_min = bounds["south"]
-    lat_max = bounds["north"]
-    lon_min = bounds["west"]
-    lon_max = bounds["east"]
+    if isinstance(bounds, tuple):
+        lat_min, lat_max, lon_min, lon_max = bounds
+    else:
+        lat_min = bounds["south"]
+        lat_max = bounds["north"]
+        lon_min = bounds["west"]
+        lon_max = bounds["east"]
 
     values = []
     for pt in points:
@@ -682,110 +685,6 @@ def download_quebec_city_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _fetch_osm_buildings(lat, lon, radius_km):
-    """Fetch building footprints from OpenStreetMap Overpass API."""
-    import urllib.request, urllib.parse, json as _json
-    half_lat = radius_km / 111.32
-    cos_lat = math.cos(math.radians(lat))
-    half_lon = radius_km / (111.32 * cos_lat)
-    bbox = f"{lat-half_lat},{lon-half_lon},{lat+half_lat},{lon+half_lon}"
-    query = f'[out:json][timeout:30];(way["building"]({bbox});relation["building"]({bbox}););(._;>;);out body;'
-    url = 'https://overpass-api.de/api/interpreter'
-    try:
-        req = urllib.request.Request(url, data=f'data={urllib.parse.quote(query)}'.encode(),
-                                     headers={"User-Agent": "RF-Planner/1.0"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        data = _json.loads(resp.read())
-    except Exception as e:
-        logger.warning(f"OSM Overpass failed: {e}")
-        return []
-
-    # Build node index
-    nodes = {}
-    for el in data.get("elements", []):
-        if el["type"] == "node":
-            nodes[el["id"]] = (el["lon"], el["lat"])
-
-    # Also build way geometry index for relations
-    ways = {}
-    for el in data.get("elements", []):
-        if el["type"] == "way":
-            nds = el.get("nodes", [])
-            coords = [nodes[n] for n in nds if n in nodes]
-            if coords:
-                ways[el["id"]] = coords
-
-    def _extract_height(tags):
-        height = None
-        if "height" in tags:
-            try: height = float(tags["height"].replace("m", "").strip())
-            except: pass
-        if height is None and "building:levels" in tags:
-            try: height = float(tags["building:levels"]) * 3.5
-            except: pass
-        return height
-
-    def _make_feature(el_id, tags, rings):
-        if not rings:
-            return None
-        # Use outer ring(s)
-        if len(rings) == 1:
-            geom = {"type": "Polygon", "coordinates": [rings[0]]}
-        else:
-            geom = {"type": "MultiPolygon", "coordinates": [[r] for r in rings]}
-        return {
-            "type": "Feature",
-            "geometry": geom,
-            "properties": {
-                "ID": f"osm_{el_id}",
-                "SOURCE_CAPTAGE": "OpenStreetMap",
-                "TYPE_BATIMENT": tags.get("building", "yes"),
-                "_height": _extract_height(tags),
-                "name": tags.get("name"),
-            },
-        }
-
-    features = []
-    for el in data.get("elements", []):
-        if el["type"] == "way":
-            tags = el.get("tags", {})
-            if "building" not in tags:
-                continue
-            nds = el.get("nodes", [])
-            coords = [nodes[n] for n in nds if n in nodes]
-            if len(coords) < 4:
-                continue
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
-            feat = _make_feature(el["id"], tags, [coords])
-            if feat:
-                features.append(feat)
-
-        elif el["type"] == "relation":
-            tags = el.get("tags", {})
-            if "building" not in tags:
-                continue
-            # Collect outer rings from relation members
-            outer_rings = []
-            for member in el.get("members", []):
-                if member.get("type") == "way" and member.get("role", "outer") == "outer":
-                    wid = member["ref"]
-                    if wid in ways:
-                        ring = ways[wid]
-                        if len(ring) >= 4:
-                            if ring[0] != ring[-1]:
-                                ring.append(ring[0])
-                            outer_rings.append(ring)
-            feat = _make_feature(el["id"], tags, outer_rings)
-            if feat:
-                features.append(feat)
-
-    return features
-
-
-# Cache for OSM buildings (key: rounded lat/lon/radius)
-_osm_cache: dict = {}
-
 # Cache for local buildings file (loaded once into memory)
 _local_buildings_cache: dict = {"data": None}
 
@@ -1050,108 +949,10 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
 
     local_data = _load_local_buildings()
 
-    # Fetch OSM buildings in grid cells (10km each to avoid Overpass timeout)
-    osm_features = []
-    osm_cell_size = 0.09  # ~10km in degrees
-    cos_lat_v = math.cos(math.radians(lat))
-    lat_lo = lat - radius_km / 111.32
-    lat_hi = lat + radius_km / 111.32
-    lon_lo = lon - radius_km / (111.32 * cos_lat_v)
-    lon_hi = lon + radius_km / (111.32 * cos_lat_v)
-
-    import numpy as _np
-    grid_lats = _np.arange(lat_lo, lat_hi, osm_cell_size)
-    grid_lons = _np.arange(lon_lo, lon_hi, osm_cell_size)
-
-    for glat in grid_lats:
-        for glon in grid_lons:
-            cell_key = (round(glat / osm_cell_size), round(glon / osm_cell_size))
-            if cell_key not in _osm_cache:
-                cell_lat = glat + osm_cell_size / 2
-                cell_lon = glon + osm_cell_size / 2
-                _osm_cache[cell_key] = _fetch_osm_buildings(cell_lat, cell_lon, osm_cell_size * 111.32 / 2)
-            osm_features.extend(_osm_cache.get(cell_key, []))
-
-    # Deduplicate: remove local buildings whose centroid is inside any OSM bounding box
-    # Build list of OSM bounding boxes
-    osm_bboxes = []
-    for f in osm_features:
-        g = f.get("geometry")
-        if not g:
-            continue
-        try:
-            all_pts = []
-            if g["type"] == "Polygon":
-                all_pts = g["coordinates"][0]
-            elif g["type"] == "MultiPolygon":
-                for poly in g["coordinates"]:
-                    all_pts.extend(poly[0])
-            if all_pts:
-                lats_r = [p[1] for p in all_pts]
-                lons_r = [p[0] for p in all_pts]
-                osm_bboxes.append((min(lats_r), max(lats_r), min(lons_r), max(lons_r)))
-        except (IndexError, KeyError):
-            pass
-
-    # Also collect OSM centroids for proximity-based dedup
-    osm_centroids = []
-    for f in osm_features:
-        g = f.get("geometry")
-        if not g:
-            continue
-        try:
-            all_pts = []
-            if g["type"] == "Polygon":
-                all_pts = g["coordinates"][0]
-            elif g["type"] == "MultiPolygon":
-                for poly in g["coordinates"]:
-                    all_pts.extend(poly[0])
-            if all_pts:
-                osm_centroids.append((
-                    sum(p[1] for p in all_pts) / len(all_pts),
-                    sum(p[0] for p in all_pts) / len(all_pts),
-                ))
-        except (IndexError, KeyError):
-            pass
-
-    def _in_any_osm_bbox(clat, clon):
-        # Check bounding box overlap
-        for lat_lo, lat_hi, lon_lo, lon_hi in osm_bboxes:
-            if lat_lo <= clat <= lat_hi and lon_lo <= clon <= lon_hi:
-                return True
-        # Check proximity to OSM centroid (~20m threshold)
-        threshold = 0.0002  # ~22m
-        for olat, olon in osm_centroids:
-            if abs(clat - olat) < threshold and abs(clon - olon) < threshold:
-                return True
-        return False
-
-    deduped_local = []
-    for f in local_data.get("features", []):
-        g = f.get("geometry")
-        if not g:
-            continue
-        coords = g.get("coordinates", [])
-        try:
-            if g["type"] == "Polygon":
-                ring = coords[0]
-            elif g["type"] == "MultiPolygon":
-                ring = coords[0][0]
-            else:
-                deduped_local.append(f)
-                continue
-            clat = sum(p[1] for p in ring) / len(ring)
-            clon = sum(p[0] for p in ring) / len(ring)
-            if not _in_any_osm_bbox(clat, clon):
-                deduped_local.append(f)
-        except (IndexError, KeyError):
-            deduped_local.append(f)
-
-    # OSM first (better heights/names), then local to fill gaps
-    data = {"features": osm_features + deduped_local}
+    # Use local data only — LiDAR provides better heights than OSM tags
+    data = local_data
 
     # Filter buildings within radius
-    import math
     cos_lat = math.cos(math.radians(lat))
     lat_range = radius_km / 111.32
     lon_range = radius_km / (111.32 * cos_lat)
@@ -1237,8 +1038,9 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         valid = block[block > 2.0]
         if len(valid) == 0:
             return None
-        # Use median — resistant to tall neighbor bleed in the bounding box
-        val = float(np.median(valid))
+        # Use 90th percentile — captures real height of tall buildings
+        # while still filtering out occasional outlier pixels
+        val = float(np.percentile(valid, 90))
         return val if val > 2.0 else None
 
     # Pass 3: assign heights
@@ -1297,4 +1099,189 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
     except Exception as e:
         logger.warning(f"Failed to cache buildings: {e}")
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Individual trees from LiDAR MHC + roads from OSM (for 3-D rendering)
+# ---------------------------------------------------------------------------
+_env_cache: dict = {}
+
+
+def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
+                               building_features: list):
+    """Detect individual trees from LiDAR canopy height model.
+
+    Samples MHC grid, excludes building footprints, and returns
+    hexagonal canopy polygons with real heights.
+    """
+    if not hasattr(terrain, 'read_block'):
+        return []
+
+    cos_lat_v = math.cos(math.radians(lat))
+    lat_range = radius_km / 111.32
+    lon_range = radius_km / (111.32 * cos_lat_v)
+
+    # Read MHC block at ~5m resolution for tree detection
+    try:
+        max_px = min(800, int(radius_km * 1000 / 5 * 2))
+        block = terrain.read_block(
+            lat - lat_range, lon - lon_range,
+            lat + lat_range, lon + lon_range,
+            dataset_type="mhc", max_pixels=max_px)
+        if block is None:
+            return []
+        mhc_grid, mhc_meta = block
+    except Exception as e:
+        logger.warning(f"Tree detection LiDAR read failed: {e}")
+        return []
+
+    lat_min = mhc_meta["lat_min"]
+    lat_max = mhc_meta["lat_max"]
+    lon_min = mhc_meta["lon_min"]
+    lon_max = mhc_meta["lon_max"]
+    h, w = mhc_grid.shape
+    res_m = mhc_meta.get("resolution_m", 5.0)
+
+    # Build building mask: rasterize building footprints onto the MHC grid
+    # Use scanline polygon fill for accurate masking
+    bldg_mask = np.zeros((h, w), dtype=bool)
+    lat_scale = h / max(lat_max - lat_min, 1e-9)
+    lon_scale = w / max(lon_max - lon_min, 1e-9)
+
+    for feat in building_features:
+        geom = feat.get("geometry", {})
+        coords = geom.get("coordinates", [])
+        try:
+            if geom["type"] == "Polygon":
+                rings = [coords[0]]
+            elif geom["type"] == "MultiPolygon":
+                rings = [p[0] for p in coords]
+            else:
+                continue
+        except (IndexError, KeyError):
+            continue
+
+        for ring in rings:
+            # Convert ring to pixel coords
+            poly_r = []
+            poly_c = []
+            for pt in ring:
+                c_px = int((pt[0] - lon_min) * lon_scale)
+                r_px = int((lat_max - pt[1]) * lat_scale)
+                poly_r.append(max(0, min(r_px, h - 1)))
+                poly_c.append(max(0, min(c_px, w - 1)))
+            if len(poly_r) < 3:
+                continue
+
+            # Scanline fill with 1px buffer around the polygon
+            r_min_p = max(0, min(poly_r) - 1)
+            r_max_p = min(h - 1, max(poly_r) + 1)
+
+            for scan_r in range(r_min_p, r_max_p + 1):
+                # Find x-intersections with polygon edges
+                intersections = []
+                n = len(poly_r)
+                for i in range(n):
+                    j = (i + 1) % n
+                    ri, rj = poly_r[i], poly_r[j]
+                    ci, cj = poly_c[i], poly_c[j]
+                    if ri == rj:
+                        continue
+                    if (ri <= scan_r < rj) or (rj <= scan_r < ri):
+                        x = ci + (scan_r - ri) * (cj - ci) / (rj - ri)
+                        intersections.append(int(x))
+                intersections.sort()
+                # Fill between pairs
+                for k in range(0, len(intersections) - 1, 2):
+                    c0 = max(0, intersections[k] - 1)
+                    c1 = min(w, intersections[k + 1] + 2)
+                    bldg_mask[scan_r, c0:c1] = True
+
+    # Find tree pixels: canopy > 2.5m and not a building
+    tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (~bldg_mask)
+
+    # Sample trees at intervals (avoid millions of points)
+    # Use step based on resolution to get ~5m spacing
+    step = max(1, int(5.0 / max(res_m, 0.5)))
+
+    # Local maxima detection: for each sample point, check if it's a local max
+    # This finds tree tops rather than random canopy points
+    from scipy.ndimage import maximum_filter
+    local_max = maximum_filter(mhc_grid, size=max(3, step)) == mhc_grid
+
+    tree_points = tree_mask & local_max
+
+    # Convert to point features (Three.js handles 3D rendering)
+    features = []
+    max_trees = 20000  # cap for performance
+    count = 0
+
+    for r in range(0, h, max(1, step // 2)):
+        if count >= max_trees:
+            break
+        for c in range(0, w, max(1, step // 2)):
+            if count >= max_trees:
+                break
+            if not tree_points[r, c]:
+                continue
+
+            canopy_h = float(mhc_grid[r, c])
+            if canopy_h < 2.5 or canopy_h > 60:
+                continue
+
+            # Convert pixel to lat/lon
+            pt_lat = lat_max - (r / h) * (lat_max - lat_min)
+            pt_lon = lon_min + (c / w) * (lon_max - lon_min)
+
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [round(pt_lon, 7), round(pt_lat, 7)]},
+                "properties": {
+                    "h": round(canopy_h, 1),
+                },
+            })
+            count += 1
+
+    logger.info(f"Tree detection: {count} trees found in {radius_km}km radius")
+    return features
+
+
+@app.get("/api/data/environment")
+def get_environment(lat: float, lon: float, radius_km: float = 2.0):
+    """Get individual trees (from LiDAR) and roads (from OSM) for 3D rendering."""
+    radius_km = min(radius_km, 3.0)  # cap for performance
+    cache_key = f"{round(lat,3)}_{round(lon,3)}_{round(radius_km,1)}"
+
+    if cache_key in _env_cache:
+        return _env_cache[cache_key]
+
+    # Get building features to exclude from tree detection (use local data only, no Overpass)
+    building_features = []
+    local_bldg = _load_local_buildings()
+    if local_bldg and "features" in local_bldg:
+        cos_lat_v = math.cos(math.radians(lat))
+        lat_r = radius_km / 111.32
+        lon_r = radius_km / (111.32 * cos_lat_v)
+        for f in local_bldg["features"]:
+            g = f.get("geometry")
+            if not g:
+                continue
+            try:
+                ring = g["coordinates"][0] if g["type"] == "Polygon" else g["coordinates"][0][0]
+                clat = sum(p[1] for p in ring) / len(ring)
+                clon = sum(p[0] for p in ring) / len(ring)
+                if abs(clat - lat) <= lat_r and abs(clon - lon) <= lon_r:
+                    building_features.append(f)
+            except (IndexError, KeyError, TypeError):
+                continue
+
+    trees = _extract_trees_from_lidar(lat, lon, radius_km, building_features)
+
+    result = {
+        "trees": {"type": "FeatureCollection", "features": trees},
+        "counts": {"trees": len(trees)},
+    }
+
+    _env_cache[cache_key] = result
     return result

@@ -1,9 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
-// deck.gl removed — MapLibre fill-extrusion with GPU hardware acceleration is fast enough
 import { AreaResponse } from '../types';
 import { Locale, t } from '../i18n';
-import { Layers, Mountain, TreePine, Building2, X, Box } from 'lucide-react';
+import { Layers, Mountain, TreePine, Building2, X, Box, Route } from 'lucide-react';
 
 interface MapProps {
   onMapClick: (lat: number, lon: number) => void;
@@ -119,6 +118,8 @@ export const MapView = React.memo(function MapView({
   const [loadingTerrain, setLoadingTerrain] = useState(false);
   const [view3D, setView3D] = useState(false);
   const [buildingsLoaded, setBuildingsLoaded] = useState(false);
+  const [showVegetation, setShowVegetation] = useState(true);
+  const [showRoads, setShowRoads] = useState(true);
   const [mapReady, setMapReady] = useState(0); // increment to signal map created
 
   onMapClickRef.current = onMapClick;
@@ -456,7 +457,7 @@ export const MapView = React.memo(function MapView({
               ],
               '#b0b0b0',
             ],
-            'fill-extrusion-height': ['get', 'height'],
+            'fill-extrusion-height': ['*', ['get', 'height'], 1.5],  // scale to match terrain exaggeration
             'fill-extrusion-base': 0,
             'fill-extrusion-opacity': 0.8,
           },
@@ -531,6 +532,124 @@ export const MapView = React.memo(function MapView({
     updateColors();
     return () => { cancelled = true; };
   }, [coverageResult]);
+
+  // 3D individual trees (Three.js) and roads (OSM)
+  const lastEnvLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const lat = txPosition[1];
+    const lon = txPosition[0];
+    const envRadius = Math.min(Math.max(radius, 1), 3);
+
+    // Skip if TX hasn't moved much
+    const prev = lastEnvLoad.current;
+    if (prev) {
+      const dlat = (lat - prev.lat) * 111320;
+      const dlon = (lon - prev.lon) * 111320 * Math.cos(lat * Math.PI / 180);
+      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(envRadius - prev.radius) < 0.5) return;
+    }
+
+    let cancelled = false;
+
+    const loadEnvironment = async () => {
+      try {
+        const resp = await fetch(`/api/data/environment?lat=${lat}&lon=${lon}&radius_km=${envRadius}`);
+        if (!resp.ok || cancelled) return;
+        const data = await resp.json();
+        if (cancelled) return;
+
+        // --- Individual 3D trees as fill-extrusion circles ---
+        const treeFeatures = data.trees?.features || [];
+        if (treeFeatures.length > 0) {
+          try {
+            if (map.getLayer('trees-3d')) map.removeLayer('trees-3d');
+            if (map.getSource('trees-source')) map.removeSource('trees-source');
+          } catch (_) { /* ignore */ }
+
+          // Convert points to small circular polygons for fill-extrusion
+          const cosLat = Math.cos((lat * Math.PI) / 180);
+          const treePolygons = treeFeatures.map((f: any) => {
+            const [lng, lt] = f.geometry.coordinates;
+            const h = f.properties.h || 8;
+            const r = Math.min(Math.max(h * 0.3, 1.5), 6); // canopy radius in meters
+            const dlat = r / 111320;
+            const dlng = r / (111320 * cosLat);
+            // Hexagon
+            const ring = [];
+            for (let i = 0; i < 6; i++) {
+              const a = (Math.PI / 3) * i;
+              ring.push([
+                Math.round((lng + dlng * Math.cos(a)) * 1e7) / 1e7,
+                Math.round((lt + dlat * Math.sin(a)) * 1e7) / 1e7,
+              ]);
+            }
+            ring.push(ring[0]);
+            return {
+              type: 'Feature',
+              geometry: { type: 'Polygon', coordinates: [ring] },
+              properties: { h },
+            };
+          });
+
+          map.addSource('trees-source', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: treePolygons },
+          });
+          map.addLayer({
+            id: 'trees-3d',
+            type: 'fill-extrusion',
+            source: 'trees-source',
+            minzoom: 13,
+            paint: {
+              'fill-extrusion-color': [
+                'interpolate', ['linear'], ['get', 'h'],
+                3, '#7cb342',
+                8, '#43a047',
+                15, '#2e7d32',
+                25, '#1b5e20',
+              ],
+              'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
+              'fill-extrusion-base': 0,
+              'fill-extrusion-opacity': 0.7,
+            },
+          }, map.getLayer('buildings-3d') ? 'buildings-3d' : undefined);
+          console.log(`3D trees loaded: ${treeFeatures.length} trees`);
+        }
+
+        lastEnvLoad.current = { lat, lon, radius: envRadius };
+      } catch (e) {
+        console.error('Environment data failed:', e);
+      }
+    };
+
+    loadEnvironment();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [txPosition[0], txPosition[1], radius, mapReady, darkMode]);
+
+  // Toggle trees visibility (Three.js custom layer)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+      if (map.getLayer('trees-3d')) {
+        map.setLayoutProperty('trees-3d', 'visibility', showVegetation ? 'visible' : 'none');
+      }
+    } catch (_) { /* layer may not exist yet */ }
+  }, [showVegetation, mapReady]);
+
+  // Toggle roads visibility
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+      if (map.getLayer('roads-3d')) {
+        map.setLayoutProperty('roads-3d', 'visibility', showRoads ? 'visible' : 'none');
+      }
+    } catch (_) { /* layer may not exist yet */ }
+  }, [showRoads, mapReady]);
 
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
@@ -607,6 +726,25 @@ export const MapView = React.memo(function MapView({
                 {fr ? 'Effacer couche' : 'Clear layer'}
               </button>
             )}
+
+            <div className="border-t border-gray-700/50 mt-1 pt-1">
+              <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 py-1">
+                {fr ? 'Couches 3D' : '3D layers'}
+              </div>
+              <LayerButton
+                icon={<TreePine className="w-3.5 h-3.5" />}
+                label={fr ? 'Arbres 3D' : '3D Trees'}
+                active={showVegetation}
+                onClick={() => setShowVegetation(!showVegetation)}
+                badge="LiDAR"
+              />
+              <LayerButton
+                icon={<Route className="w-3.5 h-3.5" />}
+                label={fr ? 'Routes' : 'Roads'}
+                active={showRoads}
+                onClick={() => setShowRoads(!showRoads)}
+              />
+            </div>
           </div>
         )}
       </div>
