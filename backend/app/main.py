@@ -103,7 +103,10 @@ def area_coverage(req: AreaRequest):
         with open(_COVERAGE_IMG_PATH, "wb") as cf:
             cf.write(result["image_data"])
         with open(_COVERAGE_META_PATH, "w") as cf:
-            _json.dump(result["bounds"], cf)
+            _json.dump({"bounds": result["bounds"], "color_schema": req.output.get("units", "dBm") if hasattr(req.output, "get") else "dBm"}, cf)
+        # Also save raw signal grid for smooth tile interpolation
+        _COVERAGE_GRID_PATH = os.path.join(OUTPUT_DIR, "_coverage_grid.npy")
+        np.save(_COVERAGE_GRID_PATH, engine._last_grid)
 
         elapsed = (time.time() - start) * 1000
 
@@ -133,6 +136,41 @@ def path_profile(req: PathRequest):
     except Exception as e:
         logger.exception("Path calculation failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/coverage/sample")
+def coverage_sample(data: dict):
+    """Sample the latest coverage grid at given lat/lon points.
+    Body: { "points": [[lat, lon], ...] }
+    Returns: { "values": [dBm_or_null, ...] }
+    Fast — no terrain queries, just grid lookup.
+    """
+    points = data.get("points", [])
+    if not points:
+        return {"values": []}
+
+    grid = engine._last_grid
+    bounds = engine._last_bounds if hasattr(engine, '_last_bounds') else None
+    if grid is None or bounds is None:
+        return {"values": [None] * len(points)}
+
+    n = grid.shape[0]
+    lat_min = bounds["south"]
+    lat_max = bounds["north"]
+    lon_min = bounds["west"]
+    lon_max = bounds["east"]
+
+    values = []
+    for pt in points:
+        lat_pt, lon_pt = pt[0], pt[1]
+        r = int((lat_max - lat_pt) / (lat_max - lat_min) * n)
+        c = int((lon_pt - lon_min) / (lon_max - lon_min) * n)
+        if 0 <= r < n and 0 <= c < n and not np.isnan(grid[r, c]):
+            values.append(round(float(grid[r, c]), 1))
+        else:
+            values.append(None)
+
+    return {"values": values}
 
 
 @app.post("/api/coverage/buildings3d")
@@ -177,17 +215,24 @@ def coverage_raster_tile(z: int, x: int, y: int):
         raise HTTPException(404, detail="No coverage computed yet")
 
     # Cache in memory per worker — reload only when file changes
+    _COVERAGE_GRID_PATH = os.path.join(OUTPUT_DIR, "_coverage_grid.npy")
     mtime = os.path.getmtime(_COVERAGE_IMG_PATH)
     if _cov_tile_cache["mtime"] != mtime or _cov_tile_cache["img"] is None:
         import json as _json
         from PIL import Image as _PILImg
         _cov_tile_cache["img"] = np.array(_PILImg.open(_COVERAGE_IMG_PATH))
         with open(_COVERAGE_META_PATH) as mf:
-            _cov_tile_cache["bounds"] = _json.load(mf)
+            meta = _json.load(mf)
+            _cov_tile_cache["bounds"] = meta.get("bounds", meta)
+        if os.path.exists(_COVERAGE_GRID_PATH):
+            _cov_tile_cache["grid"] = np.load(_COVERAGE_GRID_PATH)
+        else:
+            _cov_tile_cache["grid"] = None
         _cov_tile_cache["mtime"] = mtime
 
     src_img = _cov_tile_cache["img"]
     bounds = _cov_tile_cache["bounds"]
+    raw_grid = _cov_tile_cache.get("grid")
     src_h, src_w = src_img.shape[:2]
 
     # Tile bounds (Web Mercator → WGS84)
@@ -233,29 +278,46 @@ def coverage_raster_tile(z: int, x: int, y: int):
         from fastapi.responses import StreamingResponse
         return StreamingResponse(buf, media_type="image/png")
 
-    # Extract the region from source
-    region = src_img[y0_c:y1_c, x0_c:x1_c]
-
     tile = np.zeros((TILE_PX, TILE_PX, 4), dtype=np.uint8)
-
     total_w = x1 - x0
     total_h = y1 - y0
 
-    dst_x0 = int((x0_c - x0) / total_w * TILE_PX)
-    dst_x1 = int((x1_c - x0) / total_w * TILE_PX)
-    dst_y0 = int((y0_c - y0) / total_h * TILE_PX)
-    dst_y1 = int((y1_c - y0) / total_h * TILE_PX)
+    dst_x0 = max(0, min(int((x0_c - x0) / total_w * TILE_PX), TILE_PX - 1))
+    dst_x1 = max(dst_x0 + 1, min(int((x1_c - x0) / total_w * TILE_PX), TILE_PX))
+    dst_y0 = max(0, min(int((y0_c - y0) / total_h * TILE_PX), TILE_PX - 1))
+    dst_y1 = max(dst_y0 + 1, min(int((y1_c - y0) / total_h * TILE_PX), TILE_PX))
 
-    dst_x0 = max(0, min(dst_x0, TILE_PX - 1))
-    dst_x1 = max(dst_x0 + 1, min(dst_x1, TILE_PX))
-    dst_y0 = max(0, min(dst_y0, TILE_PX - 1))
-    dst_y1 = max(dst_y0 + 1, min(dst_y1, TILE_PX))
+    dst_w = dst_x1 - dst_x0
+    dst_h = dst_y1 - dst_y0
 
-    # Resize region to fit destination using NEAREST to preserve sharp colors
-    if region.size > 0:
-        pil_region = _Image.fromarray(region)
-        pil_region = pil_region.resize((dst_x1 - dst_x0, dst_y1 - dst_y0), _Image.BILINEAR)
-        tile[dst_y0:dst_y1, dst_x0:dst_x1] = np.array(pil_region)
+    if raw_grid is not None:
+        # Interpolate raw signal values (bilinear) then colorize — smooth + correct colors
+        grid_region = raw_grid[y0_c:y1_c, x0_c:x1_c].copy()
+        if grid_region.size > 0:
+            # Bilinear upscale of signal values
+            pil_vals = _Image.fromarray(np.nan_to_num(grid_region, nan=-999).astype(np.float32), mode='F')
+            pil_vals = pil_vals.resize((dst_w, dst_h), _Image.BILINEAR)
+            upscaled = np.array(pil_vals)
+
+            # Vectorized colorization using the same color stops
+            from .coverage.engine import COLOR_SCHEMAS
+            stops = COLOR_SCHEMAS.get("dBm", [])
+            valid = upscaled > -998
+            region_tile = np.zeros((dst_h, dst_w, 4), dtype=np.uint8)
+            # Apply colors from strongest to weakest (first match wins)
+            for threshold, rgba in stops:
+                mask = valid & (upscaled >= threshold)
+                region_tile[mask] = list(rgba)
+                valid = valid & ~mask  # don't overwrite
+
+            tile[dst_y0:dst_y0+dst_h, dst_x0:dst_x0+dst_w] = region_tile
+    else:
+        # Fallback: use pre-rendered image with NEAREST
+        region = src_img[y0_c:y1_c, x0_c:x1_c]
+        if region.size > 0:
+            pil_region = _Image.fromarray(region)
+            pil_region = pil_region.resize((dst_w, dst_h), _Image.NEAREST)
+            tile[dst_y0:dst_y1, dst_x0:dst_x1] = np.array(pil_region)
 
     img = _Image.fromarray(tile, "RGBA")
     buf = _io.BytesIO()

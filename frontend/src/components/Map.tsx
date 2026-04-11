@@ -315,7 +315,7 @@ export const MapView = React.memo(function MapView({
         id: 'coverage-layer',
         type: 'raster',
         source: 'coverage-source',
-        paint: { 'raster-opacity': 0.55, 'raster-fade-duration': 0, 'raster-resampling': 'linear' },
+        paint: { 'raster-opacity': 0.55, 'raster-fade-duration': 0 },
       });
     };
 
@@ -472,7 +472,7 @@ export const MapView = React.memo(function MapView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [txPosition[0], txPosition[1], radius, mapReady]);
 
-  // Color buildings based on coverage signal
+  // Color buildings based on actual coverage signal values (dBm)
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !coverageResult) return;
@@ -481,61 +481,52 @@ export const MapView = React.memo(function MapView({
 
     let cancelled = false;
     const features = src._data.features;
-    const { north, south, east, west } = coverageResult.bounds;
 
-    // Load the coverage image and sample pixel colors → signal values
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      if (cancelled) return;
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, img.width, img.height);
-      const pixels = imageData.data;
-
-      // Sample signal at each building centroid from the coverage image
-      let updated = 0;
-      for (const f of features) {
-        const clat = f.properties.centroid_lat;
-        const clon = f.properties.centroid_lon;
-        if (!clat || !clon) continue;
-
-        // Map lat/lon to pixel coords
-        const px = Math.floor((clon - west) / (east - west) * img.width);
-        const py = Math.floor((north - clat) / (north - south) * img.height);
-
-        if (px < 0 || px >= img.width || py < 0 || py >= img.height) {
-          f.properties.signal = null;
-          continue;
+    const updateColors = async () => {
+      // Collect centroids
+      const points: number[][] = [];
+      const indices: number[] = [];
+      for (let i = 0; i < features.length; i++) {
+        const f = features[i];
+        const clat = f.properties?.centroid_lat;
+        const clon = f.properties?.centroid_lon;
+        if (clat && clon) {
+          points.push([clat, clon]);
+          indices.push(i);
         }
-
-        const idx = (py * img.width + px) * 4;
-        const a = pixels[idx + 3];
-        if (a < 10) {
-          f.properties.signal = null;
-          continue;
-        }
-
-        // Reverse the color → signal mapping (approximate from heatmap colors)
-        const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2];
-        // Red=strong, blue=weak. Use weighted luminance as proxy.
-        // Map: red (#ff1e1e) → -30, blue (#461eaa) → -120
-        const warmth = (r * 2 - b * 1.5 + g * 0.3) / 255;
-        const signal = -120 + warmth * 90; // rough mapping
-        f.properties.signal = Math.max(-130, Math.min(-20, signal));
-        updated++;
       }
 
-      if (!cancelled && updated > 0) {
+      if (points.length === 0 || cancelled) return;
+
+      // Batch query — send in chunks of 50k to avoid huge payloads
+      const chunkSize = 50000;
+      for (let start = 0; start < points.length; start += chunkSize) {
+        if (cancelled) return;
+        const chunk = points.slice(start, start + chunkSize);
+        try {
+          const resp = await fetch('/api/coverage/sample', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ points: chunk }),
+          });
+          if (!resp.ok || cancelled) continue;
+          const { values } = await resp.json();
+          for (let j = 0; j < values.length; j++) {
+            const fi = indices[start + j];
+            features[fi].properties.signal = values[j];
+          }
+        } catch (e) {
+          console.warn('Coverage sample failed:', e);
+        }
+      }
+
+      if (!cancelled) {
         src.setData({ type: 'FeatureCollection', features });
-        console.log(`Buildings colored: ${updated} with signal`);
+        console.log(`Buildings colored with real dBm values`);
       }
     };
-    img.src = coverageResult.image_url;
 
+    updateColors();
     return () => { cancelled = true; };
   }, [coverageResult]);
 
