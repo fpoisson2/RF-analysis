@@ -97,8 +97,66 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup_index():
-    """Pre-index buildings at startup for fast MVT tile serving."""
+    """Pre-index buildings and trees at startup for fast MVT tile serving."""
     _ensure_buildings_indexed()
+    # Pre-index trees (uses disk cache if available)
+    try:
+        _ensure_trees_indexed()
+    except Exception as e:
+        logger.warning(f"Tree pre-index failed (will index on first request): {e}")
+    # Pre-generate MVT tiles for common zoom levels (background)
+    import threading
+    threading.Thread(target=_pregenerete_tiles, daemon=True).start()
+
+
+def _pregenerete_tiles():
+    """Pre-generate MVT tiles for zoom 11-14 covering the indexed area."""
+    import time as _time
+    _time.sleep(1)  # let server finish starting
+    t0 = _time.time()
+
+    # Find bounds of indexed data
+    all_bldg = _buildings_spatial_index.get("features", [])
+    all_trees = _trees_spatial_index.get("points", [])
+    if not all_bldg and not all_trees:
+        return
+
+    lats = [f["clat"] for f in (all_bldg or [])] + [p["lat"] for p in (all_trees or [])]
+    lons = [f["clon"] for f in (all_bldg or [])] + [p["lon"] for p in (all_trees or [])]
+    if not lats:
+        return
+
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
+
+    count = 0
+    for z in range(11, 15):
+        n = 2 ** z
+        x_min = int((lon_min + 180) / 360 * n)
+        x_max = int((lon_max + 180) / 360 * n)
+        y_min = int((1 - math.log(math.tan(math.radians(lat_max)) + 1/math.cos(math.radians(lat_max))) / math.pi) / 2 * n)
+        y_max = int((1 - math.log(math.tan(math.radians(lat_min)) + 1/math.cos(math.radians(lat_min))) / math.pi) / 2 * n)
+
+        for x in range(x_min, x_max + 1):
+            for y in range(y_min, y_max + 1):
+                # Buildings
+                bldg_cache = os.path.join(BUILDINGS_MVT_CACHE, f"{z}_{x}_{y}.pbf")
+                if not os.path.exists(bldg_cache):
+                    try:
+                        buildings_vector_tile(z, x, y)
+                        count += 1
+                    except Exception:
+                        pass
+                # Trees
+                tree_cache = os.path.join(TREES_MVT_CACHE, f"{z}_{x}_{y}.pbf")
+                if not os.path.exists(tree_cache):
+                    try:
+                        trees_vector_tile(z, x, y)
+                        count += 1
+                    except Exception:
+                        pass
+
+    logger.info(f"Pre-generated {count} MVT tiles in {_time.time()-t0:.1f}s")
 
 
 @app.get("/api/health")
@@ -110,6 +168,15 @@ def health():
         "gpu": gpu_status(),
         "srtm_tiles": len(srtm.get_available_tiles()),
         "lidar": terrain.get_status() if hasattr(terrain, 'get_status') else None,
+    }
+
+
+@app.get("/api/metrics")
+def get_metrics():
+    """Performance metrics for all endpoints."""
+    return {
+        "averages": _metrics["totals"],
+        "recent": _metrics["requests"][-20:],
     }
 
 
@@ -1154,19 +1221,18 @@ _env_cache: dict = {}
 
 def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
                                building_features: list):
-    """Detect individual trees from LiDAR canopy height model.
+    """Detect individual trees from LiDAR MHC. Optimized with cv2 + numpy."""
+    import cv2
+    from scipy.ndimage import maximum_filter
 
-    Samples MHC grid, excludes building footprints, and returns
-    hexagonal canopy polygons with real heights.
-    """
     if not hasattr(terrain, 'read_block'):
         return []
 
     cos_lat_v = math.cos(math.radians(lat))
     lat_range = radius_km / 111.32
     lon_range = radius_km / (111.32 * cos_lat_v)
+    t0 = time.time()
 
-    # Read MHC block — aim for ~5m resolution
     try:
         max_px = min(2000, int(radius_km * 1000 / 5 * 2))
         block = terrain.read_block(
@@ -1179,124 +1245,108 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     except Exception as e:
         logger.warning(f"Tree detection LiDAR read failed: {e}")
         return []
+    t_lidar = time.time()
 
-    lat_min = mhc_meta["lat_min"]
-    lat_max = mhc_meta["lat_max"]
-    lon_min = mhc_meta["lon_min"]
-    lon_max = mhc_meta["lon_max"]
+    lat_min, lat_max_v = mhc_meta["lat_min"], mhc_meta["lat_max"]
+    lon_min, lon_max_v = mhc_meta["lon_min"], mhc_meta["lon_max"]
     h, w = mhc_grid.shape
     res_m = mhc_meta.get("resolution_m", 5.0)
+    lat_scale = h / max(lat_max_v - lat_min, 1e-9)
+    lon_scale = w / max(lon_max_v - lon_min, 1e-9)
 
-    # Build building mask: rasterize building footprints onto the MHC grid
-    # Use scanline polygon fill for accurate masking
-    bldg_mask = np.zeros((h, w), dtype=bool)
-    lat_scale = h / max(lat_max - lat_min, 1e-9)
-    lon_scale = w / max(lon_max - lon_min, 1e-9)
-
+    # Building mask via cv2.fillPoly (>>100x faster than Python scanline)
+    bldg_mask = np.zeros((h, w), dtype=np.uint8)
+    polys = []
     for feat in building_features:
         geom = feat.get("geometry", {})
         coords = geom.get("coordinates", [])
         try:
-            if geom["type"] == "Polygon":
-                rings = [coords[0]]
-            elif geom["type"] == "MultiPolygon":
-                rings = [p[0] for p in coords]
-            else:
-                continue
+            rings = [coords[0]] if geom["type"] == "Polygon" else [p[0] for p in coords]
         except (IndexError, KeyError):
             continue
-
         for ring in rings:
-            # Convert ring to pixel coords
-            poly_r = []
-            poly_c = []
-            for pt in ring:
-                c_px = int((pt[0] - lon_min) * lon_scale)
-                r_px = int((lat_max - pt[1]) * lat_scale)
-                poly_r.append(max(0, min(r_px, h - 1)))
-                poly_c.append(max(0, min(c_px, w - 1)))
-            if len(poly_r) < 3:
+            if len(ring) < 3:
                 continue
+            pts = np.array([[int((p[0] - lon_min) * lon_scale),
+                             int((lat_max_v - p[1]) * lat_scale)] for p in ring], dtype=np.int32)
+            pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+            polys.append(pts)
+    if polys:
+        cv2.fillPoly(bldg_mask, polys, 1)
+        cv2.dilate(bldg_mask, np.ones((3, 3), np.uint8), dst=bldg_mask, iterations=1)
+    t_mask = time.time()
 
-            # Scanline fill with 1px buffer around the polygon
-            r_min_p = max(0, min(poly_r) - 1)
-            r_max_p = min(h - 1, max(poly_r) + 1)
-
-            for scan_r in range(r_min_p, r_max_p + 1):
-                # Find x-intersections with polygon edges
-                intersections = []
-                n = len(poly_r)
-                for i in range(n):
-                    j = (i + 1) % n
-                    ri, rj = poly_r[i], poly_r[j]
-                    ci, cj = poly_c[i], poly_c[j]
-                    if ri == rj:
-                        continue
-                    if (ri <= scan_r < rj) or (rj <= scan_r < ri):
-                        x = ci + (scan_r - ri) * (cj - ci) / (rj - ri)
-                        intersections.append(int(x))
-                intersections.sort()
-                # Fill between pairs
-                for k in range(0, len(intersections) - 1, 2):
-                    c0 = max(0, intersections[k] - 1)
-                    c1 = min(w, intersections[k + 1] + 2)
-                    bldg_mask[scan_r, c0:c1] = True
-
-    # Find tree pixels: canopy > 2.5m and not a building
-    logger.info(f"Building mask: {bldg_mask.sum()} of {bldg_mask.size} pixels masked ({100*bldg_mask.sum()/bldg_mask.size:.1f}%)")
-    tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (~bldg_mask)
-
-    # Sample trees at intervals (avoid millions of points)
-    # Use step based on resolution to get ~5m spacing
+    # Tree detection: canopy > 2.5m, not NaN, not building, local max
+    tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (bldg_mask == 0)
     step = max(1, int(5.0 / max(res_m, 0.5)))
-
-    # Local maxima detection: for each sample point, check if it's a local max
-    # This finds tree tops rather than random canopy points
-    from scipy.ndimage import maximum_filter
     local_max = maximum_filter(mhc_grid, size=max(3, step)) == mhc_grid
+    combined = tree_mask & local_max
 
-    tree_points = tree_mask & local_max
-
-    # Subsample tree_points at step intervals
-    sampled = np.zeros_like(tree_points)
+    # Subsample
+    sampled = np.zeros_like(combined)
     s2 = max(1, step // 2)
-    sampled[::s2, ::s2] = tree_points[::s2, ::s2]
+    sampled[::s2, ::s2] = combined[::s2, ::s2]
 
-    # Extract all tree positions at once (vectorized)
     rows, cols = np.where(sampled)
     heights = mhc_grid[rows, cols]
     valid = (heights >= 2.5) & (heights <= 60)
     rows, cols, heights = rows[valid], cols[valid], heights[valid]
+    t_detect = time.time()
 
-    # Convert pixel coords to lat/lon
-    lats = lat_max - (rows / h) * (lat_max - lat_min)
-    lons = lon_min + (cols / w) * (lon_max - lon_min)
+    # Vectorized coordinate conversion
+    lats_arr = np.round(lat_max_v - (rows / h) * (lat_max_v - lat_min), 7)
+    lons_arr = np.round(lon_min + (cols / w) * (lon_max_v - lon_min), 7)
+    heights_r = np.round(heights, 1)
+
+    # Build GeoJSON — use tolist() for fast conversion
+    lons_list = lons_arr.tolist()
+    lats_list = lats_arr.tolist()
+    h_list = heights_r.tolist()
 
     features = [
-        {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [round(float(lons[i]), 7), round(float(lats[i]), 7)]},
-            "properties": {"h": round(float(heights[i]), 1)},
-        }
+        {"type": "Feature",
+         "geometry": {"type": "Point", "coordinates": [lons_list[i], lats_list[i]]},
+         "properties": {"h": h_list[i]}}
         for i in range(len(rows))
     ]
+    t_json = time.time()
 
-    logger.info(f"Tree detection: {len(features)} trees found in {radius_km}km radius")
+    logger.info(f"Trees: {len(features)} in {radius_km}km | "
+                f"lidar={int((t_lidar-t0)*1000)}ms mask={int((t_mask-t_lidar)*1000)}ms({len(polys)}p) "
+                f"detect={int((t_detect-t_mask)*1000)}ms json={int((t_json-t_detect)*1000)}ms "
+                f"TOTAL={int((t_json-t0)*1000)}ms")
     return features
+
+
+TREES_CACHE_DIR = os.path.join(OUTPUT_DIR, "trees_cache")
+os.makedirs(TREES_CACHE_DIR, exist_ok=True)
 
 
 @app.get("/api/data/environment")
 def get_environment(lat: float, lon: float, radius_km: float = 2.0):
     """Get individual trees (from LiDAR) for 3D rendering."""
+    import json as _json
     t0 = time.time()
-    radius_km = min(radius_km, 10.0)  # cap for performance
-    cache_key = f"{round(lat,3)}_{round(lon,3)}_{round(radius_km,1)}"
+    radius_km = min(radius_km, 10.0)
+    cache_key = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
 
+    # Memory cache
     if cache_key in _env_cache:
         _record_metric("trees", (time.time() - t0) * 1000, {"cached": True})
         return _env_cache[cache_key]
 
-    # Get building features to exclude from tree detection (use local data only, no Overpass)
+    # Disk cache
+    disk_path = os.path.join(TREES_CACHE_DIR, f"trees_{cache_key}.json")
+    if os.path.exists(disk_path):
+        with open(disk_path) as f:
+            result = _json.load(f)
+        _env_cache[cache_key] = result
+        _record_metric("trees", (time.time() - t0) * 1000,
+                       {"cached": True, "disk": True, "trees": result.get("counts", {}).get("trees", 0)})
+        return result
+
+    # Get building features to exclude from tree detection
     building_features = []
     local_bldg = _load_local_buildings()
     if local_bldg and "features" in local_bldg:
@@ -1323,7 +1373,229 @@ def get_environment(lat: float, lon: float, radius_km: float = 2.0):
         "counts": {"trees": len(trees)},
     }
 
+    # Save to disk cache
+    try:
+        with open(disk_path, 'w') as f:
+            _json.dump(result, f)
+        logger.info(f"Trees cached: {disk_path} ({len(trees)} trees)")
+    except Exception as e:
+        logger.warning(f"Failed to cache trees: {e}")
+
     _record_metric("trees", (time.time() - t0) * 1000,
                    {"trees": len(trees), "cached": False})
     _env_cache[cache_key] = result
     return result
+
+
+SCENE_CACHE_DIR = os.path.join(OUTPUT_DIR, "scene_cache")
+os.makedirs(SCENE_CACHE_DIR, exist_ok=True)
+
+# Pre-indexed trees for MVT
+_trees_spatial_index: dict = {"points": None, "grid": None, "loaded": False}
+_TREE_GRID_RES = 0.005  # ~500m cells for faster spatial lookup
+
+
+def _ensure_trees_indexed(lat: float = 46.83, lon: float = -71.23, radius_km: float = 10.0):
+    """Load trees into spatial index for MVT tile serving."""
+    if _trees_spatial_index["loaded"]:
+        return _trees_spatial_index["points"]
+
+    import json as _json
+
+    # Try disk cache
+    cache_key = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
+    disk_path = os.path.join(TREES_CACHE_DIR, f"trees_{cache_key}.json")
+    points = []
+
+    if os.path.exists(disk_path):
+        with open(disk_path) as f:
+            data = _json.load(f)
+        for feat in data.get("trees", {}).get("features", []):
+            coords = feat["geometry"]["coordinates"]
+            h = feat["properties"]["h"]
+            points.append({"lon": coords[0], "lat": coords[1], "h": h})
+    else:
+        # Generate trees
+        env = get_environment(lat, lon, radius_km)
+        for feat in env.get("trees", {}).get("features", []):
+            coords = feat["geometry"]["coordinates"]
+            h = feat["properties"]["h"]
+            points.append({"lon": coords[0], "lat": coords[1], "h": h})
+
+    # Build spatial grid
+    grid: dict = {}
+    for i, p in enumerate(points):
+        gk = (int(p["lat"] / _TREE_GRID_RES), int(p["lon"] / _TREE_GRID_RES))
+        grid.setdefault(gk, []).append(i)
+
+    _trees_spatial_index["points"] = points
+    _trees_spatial_index["grid"] = grid
+    _trees_spatial_index["loaded"] = True
+    logger.info(f"Indexed {len(points)} trees for MVT, {len(grid)} grid cells")
+    return points
+
+
+TREES_MVT_CACHE = os.path.join(OUTPUT_DIR, "trees_mvt")
+os.makedirs(TREES_MVT_CACHE, exist_ok=True)
+
+
+@app.get("/api/trees/tiles/{z}/{x}/{y}.pbf")
+def trees_vector_tile(z: int, x: int, y: int):
+    """Serve trees as Mapbox Vector Tiles with hexagon canopy polygons."""
+    import mapbox_vector_tile as mvt
+    from starlette.responses import Response
+
+    cache_path = os.path.join(TREES_MVT_CACHE, f"{z}_{x}_{y}.pbf")
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return Response(content=open(cache_path, "rb").read(),
+                       media_type="application/x-protobuf",
+                       headers={"Cache-Control": "public, max-age=86400"})
+
+    # Tile bounds
+    n = 2 ** z
+    lon_min = x / n * 360.0 - 180.0
+    lon_max = (x + 1) / n * 360.0 - 180.0
+    lat_max_v = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    lat_min_v = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+
+    buf_lat = (lat_max_v - lat_min_v) * 0.05
+    buf_lon = (lon_max - lon_min) * 0.05
+
+    all_points = _ensure_trees_indexed()
+    grid = _trees_spatial_index.get("grid", {})
+    if not all_points:
+        content = mvt.encode([{"name": "trees", "features": []}],
+                             quantize_bounds=(lon_min, lat_min_v, lon_max, lat_max_v))
+        with open(cache_path, "wb") as f:
+            f.write(content)
+        return Response(content=content, media_type="application/x-protobuf",
+                       headers={"Cache-Control": "public, max-age=86400"})
+
+    # Spatial lookup
+    lat_g0 = int((lat_min_v - buf_lat) / _TREE_GRID_RES)
+    lat_g1 = int((lat_max_v + buf_lat) / _TREE_GRID_RES) + 1
+    lon_g0 = int((lon_min - buf_lon) / _TREE_GRID_RES)
+    lon_g1 = int((lon_max + buf_lon) / _TREE_GRID_RES) + 1
+
+    indices = set()
+    for glat in range(lat_g0, lat_g1 + 1):
+        for glon in range(lon_g0, lon_g1 + 1):
+            indices.update(grid.get((glat, glon), []))
+
+    # Build canopy + trunk MVT features
+    cos_lat = math.cos(math.radians((lat_min_v + lat_max_v) / 2))
+    hex_angles = [(math.cos(math.pi / 3 * i), math.sin(math.pi / 3 * i)) for i in range(6)]
+
+    canopy_feats = []
+    trunk_feats = []
+    for idx in indices:
+        p = all_points[idx]
+        if not (lat_min_v - buf_lat <= p["lat"] <= lat_max_v + buf_lat and
+                lon_min - buf_lon <= p["lon"] <= lon_max + buf_lon):
+            continue
+        h = p["h"]
+        # Canopy hexagon
+        cr = max(3, h * 0.4)
+        cdlat = cr / 111320
+        cdlng = cr / (111320 * cos_lat)
+        cring = [(p["lon"] + cdlng * hc, p["lat"] + cdlat * hs) for hc, hs in hex_angles]
+        cring.append(cring[0])
+        canopy_feats.append({
+            "geometry": {"type": "Polygon", "coordinates": [cring]},
+            "properties": {"h": round(h, 1), "base": round(h * 0.3, 1)},
+        })
+        # Trunk hexagon
+        tr = max(0.5, h * 0.06)
+        tdlat = tr / 111320
+        tdlng = tr / (111320 * cos_lat)
+        tring = [(p["lon"] + tdlng * hc, p["lat"] + tdlat * hs) for hc, hs in hex_angles]
+        tring.append(tring[0])
+        trunk_feats.append({
+            "geometry": {"type": "Polygon", "coordinates": [tring]},
+            "properties": {"h": round(h * 0.3, 1)},
+        })
+
+    layers = [
+        {"name": "canopy", "features": canopy_feats},
+        {"name": "trunk", "features": trunk_feats},
+    ]
+    content = mvt.encode(layers, quantize_bounds=(lon_min, lat_min_v, lon_max, lat_max_v))
+
+    with open(cache_path, "wb") as f:
+        f.write(content)
+
+    return Response(content=content, media_type="application/x-protobuf",
+                   headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/data/scene")
+def get_scene(lat: float, lon: float, radius_km: float = 2.0):
+    """Combined endpoint: buildings + trees in compact binary format.
+    Binary cached to disk for instant subsequent loads.
+    Format: [magic:4] [n_bldg:u32] [n_trees:u32] [server_ms:f32]
+            then per building: [n_verts:u16] [height:f32] [lon,lat pairs as f32...]
+            then per tree: [lon:f32] [lat:f32] [height:f32]"""
+    import struct
+    from starlette.responses import Response
+
+    cache_key = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
+    bin_path = os.path.join(SCENE_CACHE_DIR, f"scene_{cache_key}.bin")
+
+    # Serve from binary cache if available
+    if os.path.exists(bin_path):
+        return FileResponse(bin_path, media_type="application/octet-stream",
+                           headers={"Cache-Control": "public, max-age=300"})
+
+    t0 = time.time()
+
+    buildings_result = get_buildings(lat, lon, radius_km)
+    env_result = get_environment(lat, lon, radius_km)
+
+    bldg_features = buildings_result.get("features", [])
+    tree_features = env_result.get("trees", {}).get("features", [])
+
+    server_ms = (time.time() - t0) * 1000
+
+    # Build binary buffer
+    buf = bytearray()
+    buf.extend(b'SC3D')  # magic
+    buf.extend(struct.pack('<IIf', len(bldg_features), len(tree_features), server_ms))
+
+    # Buildings
+    for feat in bldg_features:
+        geom = feat.get("geometry", {})
+        h = float(feat.get("properties", {}).get("_height", 8))
+        coords = geom.get("coordinates", [])
+        try:
+            ring = coords[0] if geom["type"] == "Polygon" else coords[0][0]
+        except (IndexError, KeyError):
+            continue
+        n = len(ring)
+        if n < 3 or n > 65535:
+            continue
+        buf.extend(struct.pack('<Hf', n, h))
+        for p in ring:
+            buf.extend(struct.pack('<ff', float(p[0]), float(p[1])))
+
+    # Trees
+    for feat in tree_features:
+        coords = feat.get("geometry", {}).get("coordinates", [0, 0])
+        h = float(feat.get("properties", {}).get("h", 8))
+        buf.extend(struct.pack('<fff', float(coords[0]), float(coords[1]), h))
+
+    # Cache binary to disk
+    try:
+        with open(bin_path, 'wb') as f:
+            f.write(buf)
+        logger.info(f"Scene cached: {bin_path} ({len(buf)/1e6:.1f}MB)")
+    except Exception as e:
+        logger.warning(f"Scene cache write failed: {e}")
+
+    logger.info(f"Scene binary: {len(bldg_features)} bldg + {len(tree_features)} trees = "
+                f"{len(buf)/1e6:.1f}MB, server {server_ms:.0f}ms")
+
+    return Response(
+        content=bytes(buf),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=300"},
+    )

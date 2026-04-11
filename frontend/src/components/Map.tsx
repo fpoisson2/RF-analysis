@@ -655,99 +655,118 @@ export const MapView = React.memo(function MapView({
     }
   }, [view3D, mapReady]);
 
-  // 3D buildings via MapLibre fill-extrusion (sits on terrain, GPU accelerated)
-  const lastBuildingsLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
+  // Load entire 3D scene in one binary request (buildings + trees)
+  const lastSceneLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    const lat = txPosition[1];
-    const lon = txPosition[0];
-    const buildingsRadius = Math.min(Math.max(radius, 2), 100);
+    const lat = txPosition[1], lon = txPosition[0];
+    const sceneRadius = Math.min(Math.max(radius, 2), 100);
 
-    // Skip if TX hasn't moved much
-    const prev = lastBuildingsLoad.current;
+    const prev = lastSceneLoad.current;
     if (prev) {
       const dlat = (lat - prev.lat) * 111320;
       const dlon = (lon - prev.lon) * 111320 * Math.cos(lat * Math.PI / 180);
-      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(buildingsRadius - prev.radius) < 0.5) return;
+      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(sceneRadius - prev.radius) < 0.5) return;
     }
 
     let cancelled = false;
-
-    const loadBuildings = async () => {
+    const loadScene = async () => {
       try {
-        const bResp = await fetch(`/api/data/buildings?lat=${lat}&lon=${lon}&radius_km=${buildingsRadius}`);
-        if (!bResp.ok || cancelled) return;
-        const data = await bResp.json();
-        if (!data?.features || cancelled) return;
+        const resp = await fetch(`/api/data/scene?lat=${lat}&lon=${lon}&radius_km=${sceneRadius}`);
+        if (!resp.ok || cancelled) return;
+        const buf = await resp.arrayBuffer();
+        if (cancelled) return;
 
-        const features = data.features
-          .filter((f: any) => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
-          .map((f: any) => {
-            const h = Number(f.properties?._height ?? f.properties?.HAUTEUR ?? f.properties?.HEIGHT ?? 8);
-            const ring = f.geometry.type === 'Polygon'
-              ? f.geometry.coordinates[0]
-              : f.geometry.coordinates[0][0];
-            const cLat = ring.reduce((s: number, p: number[]) => s + p[1], 0) / ring.length;
-            const cLon = ring.reduce((s: number, p: number[]) => s + p[0], 0) / ring.length;
-            return { ...f, properties: { ...f.properties, height: h, centroid_lat: cLat, centroid_lon: cLon } };
-          });
+        const tFetch = performance.now() - loadStartRef.current;
+        const view = new DataView(buf);
+        let off = 4;
+        const nBldg = view.getUint32(off, true); off += 4;
+        const nTrees = view.getUint32(off, true); off += 4;
+        const serverMs = view.getFloat32(off, true); off += 4;
+        setLoadMetrics(m => ({ ...m, fetch: Math.round(tFetch) }));
+        console.log(`⏱ Scene fetched: ${nBldg} bldg + ${nTrees} trees (${Math.round(tFetch)}ms, ${(buf.byteLength/1e6).toFixed(1)}MB, server ${Math.round(serverMs)}ms)`);
 
-        if (cancelled || features.length === 0) return;
+        // --- Buildings from binary ---
+        const bldgFeatures = new Array(nBldg);
+        for (let i = 0; i < nBldg; i++) {
+          const nVerts = view.getUint16(off, true); off += 2;
+          const h = view.getFloat32(off, true); off += 4;
+          const ring = new Array(nVerts);
+          let cLat = 0, cLon = 0;
+          for (let v = 0; v < nVerts; v++) {
+            const lng = view.getFloat32(off, true); off += 4;
+            const lt = view.getFloat32(off, true); off += 4;
+            ring[v] = [lng, lt]; cLon += lng; cLat += lt;
+          }
+          cLon /= nVerts; cLat /= nVerts;
+          bldgFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
+            properties: { height: h, centroid_lat: cLat, centroid_lon: cLon } };
+        }
 
-        try {
-          if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
-          if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
-        } catch (_) { /* ignore */ }
+        if (bldgFeatures.length > 0 && !cancelled) {
+          try { if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d'); if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source'); } catch (_) {}
+          map.addSource('buildings-3d-source', { type: 'geojson', data: { type: 'FeatureCollection', features: bldgFeatures } });
+          map.addLayer({ id: 'buildings-3d', type: 'fill-extrusion', source: 'buildings-3d-source',
+            paint: {
+              'fill-extrusion-color': ['case', ['==', ['typeof', ['get', 'signal']] as any, 'number'],
+                ['interpolate', ['linear'], ['get', 'signal'], -120, '#461eaa', -100, '#0082d2', -90, '#00b478', -80, '#64e114', -70, '#dcf000', -60, '#ffbe00', -50, '#ff6e00', -30, '#ff1e1e'],
+                '#b0b0b0'],
+              'fill-extrusion-height': ['*', ['get', 'height'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.8,
+            } });
+          setBuildingsLoaded(true);
+          console.log(`⏱ Buildings rendered: ${bldgFeatures.length} (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+        }
 
-        map.addSource('buildings-3d-source', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features },
-        });
-        map.addLayer({
-          id: 'buildings-3d',
-          type: 'fill-extrusion',
-          source: 'buildings-3d-source',
-          minzoom: 11,
-          paint: {
-            'fill-extrusion-color': [
-              'case',
-              ['==', ['typeof', ['get', 'signal']] as any, 'number'],
-              [
-                'interpolate', ['linear'], ['get', 'signal'],
-                -120, '#461eaa',
-                -100, '#0082d2',
-                -90,  '#00b478',
-                -80,  '#64e114',
-                -70,  '#dcf000',
-                -60,  '#ffbe00',
-                -50,  '#ff6e00',
-                -30,  '#ff1e1e',
-              ],
-              '#b0b0b0',
-            ],
-            'fill-extrusion-height': ['*', ['get', 'height'], 1.5],  // scale to match terrain exaggeration
-            'fill-extrusion-base': 0,
-            'fill-extrusion-opacity': 0.8,
-          },
-        });
-        setBuildingsLoaded(true);
-        lastBuildingsLoad.current = { lat, lon, radius: buildingsRadius };
-        const t = performance.now() - loadStartRef.current;
-        setLoadMetrics(m => ({ ...m, buildings: Math.round(t) }));
-        console.log(`⏱ 3D buildings loaded: ${features.length} features (${Math.round(t)}ms)`);
-      } catch (e) {
-        console.error('3D buildings failed:', e);
-      }
+        // --- Trees: trunk + canopy ---
+        if (nTrees > 0 && !cancelled) {
+          try { if (map.getLayer('trees-canopy')) map.removeLayer('trees-canopy'); if (map.getLayer('trees-trunk')) map.removeLayer('trees-trunk');
+                if (map.getSource('trees-canopy-src')) map.removeSource('trees-canopy-src'); if (map.getSource('trees-trunk-src')) map.removeSource('trees-trunk-src'); } catch (_) {}
+
+          const cosLat = Math.cos((lat * Math.PI) / 180);
+          const hc = [1, 0.5, -0.5, -1, -0.5, 0.5, 1], hs = [0, 0.866, 0.866, 0, -0.866, -0.866, 0];
+          const canopyFeatures = new Array(nTrees), trunkFeatures = new Array(nTrees);
+
+          for (let i = 0; i < nTrees; i++) {
+            const tlng = view.getFloat32(off, true); off += 4;
+            const tlat = view.getFloat32(off, true); off += 4;
+            const h = view.getFloat32(off, true); off += 4;
+            const cr = Math.max(3, h * 0.4), cdlat = cr / 111320, cdlng = cr / (111320 * cosLat);
+            const cring = new Array(7);
+            for (let j = 0; j < 7; j++) cring[j] = [tlng + cdlng * hc[j], tlat + cdlat * hs[j]];
+            canopyFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [cring] }, properties: { h, base: h * 0.3 } };
+            const tr = Math.max(0.5, h * 0.06), tdlat = tr / 111320, tdlng = tr / (111320 * cosLat);
+            const tring = new Array(7);
+            for (let j = 0; j < 7; j++) tring[j] = [tlng + tdlng * hc[j], tlat + tdlat * hs[j]];
+            trunkFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [tring] }, properties: { h: h * 0.3 } };
+          }
+
+          map.addSource('trees-trunk-src', { type: 'geojson', data: { type: 'FeatureCollection', features: trunkFeatures } });
+          map.addLayer({ id: 'trees-trunk', type: 'fill-extrusion', source: 'trees-trunk-src',
+            paint: { 'fill-extrusion-color': '#5D4037', 'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.9 } });
+          map.addSource('trees-canopy-src', { type: 'geojson', data: { type: 'FeatureCollection', features: canopyFeatures } });
+          map.addLayer({ id: 'trees-canopy', type: 'fill-extrusion', source: 'trees-canopy-src',
+            paint: { 'fill-extrusion-color': ['interpolate', ['linear'], ['get', 'h'], 3, '#7cb342', 10, '#43a047', 20, '#2e7d32'],
+              'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': ['*', ['get', 'base'], 1.5], 'fill-extrusion-opacity': 0.8 } });
+
+          console.log(`⏱ Trees rendered: ${nTrees} canopy + trunk (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+        }
+
+        lastSceneLoad.current = { lat, lon, radius: sceneRadius };
+        setSceneReady(true);
+        const totalT = performance.now() - loadStartRef.current;
+        setLoadMetrics(m => ({ ...m, total: Math.round(totalT) }));
+        console.log(`⏱ Scene complete: ${Math.round(totalT)}ms`);
+      } catch (e) { console.error('Scene load failed:', e); setSceneReady(true); }
     };
 
-    loadBuildings();
+    loadScene();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [txPosition[0], txPosition[1], radius, mapReady]);
 
-  // Color buildings based on actual coverage signal values (dBm)
+  // Color buildings based on coverage signal values (dBm)
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !coverageResult) return;
@@ -758,192 +777,34 @@ export const MapView = React.memo(function MapView({
     const features = src._data.features;
 
     const updateColors = async () => {
-      // Collect centroids
       const points: number[][] = [];
       const indices: number[] = [];
       for (let i = 0; i < features.length; i++) {
-        const f = features[i];
-        const clat = f.properties?.centroid_lat;
-        const clon = f.properties?.centroid_lon;
-        if (clat && clon) {
-          points.push([clat, clon]);
-          indices.push(i);
-        }
+        const clat = features[i].properties?.centroid_lat;
+        const clon = features[i].properties?.centroid_lon;
+        if (clat && clon) { points.push([clat, clon]); indices.push(i); }
       }
-
       if (points.length === 0 || cancelled) return;
 
-      // Batch query — send in chunks of 50k to avoid huge payloads
       const chunkSize = 50000;
       for (let start = 0; start < points.length; start += chunkSize) {
         if (cancelled) return;
-        const chunk = points.slice(start, start + chunkSize);
         try {
           const resp = await fetch('/api/coverage/sample', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ points: chunk }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ points: points.slice(start, start + chunkSize) }),
           });
           if (!resp.ok || cancelled) continue;
           const { values } = await resp.json();
-          for (let j = 0; j < values.length; j++) {
-            const fi = indices[start + j];
-            features[fi].properties.signal = values[j];
-          }
-        } catch (e) {
-          console.warn('Coverage sample failed:', e);
-        }
+          for (let j = 0; j < values.length; j++) features[indices[start + j]].properties.signal = values[j];
+        } catch (e) { console.warn('Coverage sample failed:', e); }
       }
-
-      if (!cancelled) {
-        src.setData({ type: 'FeatureCollection', features });
-        console.log(`Buildings colored with real dBm values`);
-      }
+      if (!cancelled) { src.setData({ type: 'FeatureCollection', features }); console.log('Buildings colored'); }
     };
 
     updateColors();
     return () => { cancelled = true; };
   }, [coverageResult]);
-
-  // 3D individual trees (Three.js) and roads (OSM)
-  const lastEnvLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const lat = txPosition[1];
-    const lon = txPosition[0];
-    const envRadius = Math.min(Math.max(radius, 2), 10);
-
-    // Skip if TX hasn't moved much
-    const prev = lastEnvLoad.current;
-    if (prev) {
-      const dlat = (lat - prev.lat) * 111320;
-      const dlon = (lon - prev.lon) * 111320 * Math.cos(lat * Math.PI / 180);
-      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(envRadius - prev.radius) < 0.5) return;
-    }
-
-    let cancelled = false;
-
-    const loadEnvironment = async () => {
-      try {
-        const resp = await fetch(`/api/data/environment?lat=${lat}&lon=${lon}&radius_km=${envRadius}`);
-        if (!resp.ok || cancelled) return;
-        const data = await resp.json();
-        if (cancelled) return;
-
-        // --- 3D trees ---
-        const treeFeatures = data.trees?.features || [];
-        if (treeFeatures.length > 0) {
-          try {
-            if (map.getLayer('trees-3d')) map.removeLayer('trees-3d');
-            if (map.getLayer('trees-trunk')) map.removeLayer('trees-trunk');
-            if (map.getSource('trees-3d-src')) map.removeSource('trees-3d-src');
-            if (map.getSource('trees-trunk-src')) map.removeSource('trees-trunk-src');
-          } catch (_) { /* ignore */ }
-
-          // Generate canopy + trunk hexagons from point data
-          const cosLat = Math.cos((lat * Math.PI) / 180);
-          const canopyFeatures: any[] = [];
-          const trunkFeatures: any[] = [];
-
-          for (const f of treeFeatures) {
-            const [tlng, tlat] = f.geometry.coordinates;
-            const h = f.properties.h || 8;
-
-            // Canopy hexagon (wide)
-            const cr = Math.max(3, h * 0.4);
-            const cdlat = cr / 111320;
-            const cdlng = cr / (111320 * cosLat);
-            const cring: number[][] = [];
-            for (let i = 0; i < 6; i++) {
-              const a = (Math.PI / 3) * i;
-              cring.push([tlng + cdlng * Math.cos(a), tlat + cdlat * Math.sin(a)]);
-            }
-            cring.push(cring[0]);
-            canopyFeatures.push({
-              type: 'Feature',
-              geometry: { type: 'Polygon', coordinates: [cring] },
-              properties: { h, base: h * 0.3 },
-            });
-
-            // Trunk hexagon (thin)
-            const tr = Math.max(0.5, h * 0.06);
-            const tdlat = tr / 111320;
-            const tdlng = tr / (111320 * cosLat);
-            const tring: number[][] = [];
-            for (let i = 0; i < 6; i++) {
-              const a = (Math.PI / 3) * i;
-              tring.push([tlng + tdlng * Math.cos(a), tlat + tdlat * Math.sin(a)]);
-            }
-            tring.push(tring[0]);
-            trunkFeatures.push({
-              type: 'Feature',
-              geometry: { type: 'Polygon', coordinates: [tring] },
-              properties: { h: h * 0.3 },
-            });
-          }
-
-          // Trunk layer (brown, from ground to 30% height)
-          map.addSource('trees-trunk-src', {
-            type: 'geojson',
-            data: { type: 'FeatureCollection', features: trunkFeatures },
-          });
-          map.addLayer({
-            id: 'trees-trunk',
-            type: 'fill-extrusion',
-            source: 'trees-trunk-src',
-            paint: {
-              'fill-extrusion-color': '#5D4037',
-              'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
-              'fill-extrusion-base': 0,
-              'fill-extrusion-opacity': 0.9,
-            },
-          });
-
-          // Canopy layer (green, from 30% to 100% height)
-          map.addSource('trees-3d-src', {
-            type: 'geojson',
-            data: { type: 'FeatureCollection', features: canopyFeatures },
-          });
-          map.addLayer({
-            id: 'trees-3d',
-            type: 'fill-extrusion',
-            source: 'trees-3d-src',
-            paint: {
-              'fill-extrusion-color': [
-                'interpolate', ['linear'], ['get', 'h'],
-                3, '#7cb342',
-                10, '#43a047',
-                20, '#2e7d32',
-              ],
-              'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
-              'fill-extrusion-base': ['*', ['get', 'base'], 1.5],
-              'fill-extrusion-opacity': 0.8,
-            },
-          });
-
-          const t = performance.now() - loadStartRef.current;
-          setLoadMetrics(m => ({ ...m, trees: Math.round(t) }));
-          console.log(`⏱ 3D trees: ${canopyFeatures.length} (${Math.round(t)}ms)`);
-        }
-
-        lastEnvLoad.current = { lat, lon, radius: envRadius };
-        // Mark scene as ready once trees are loaded (last heavy layer)
-        setSceneReady(true);
-        const totalT = performance.now() - loadStartRef.current;
-        setLoadMetrics(m => ({ ...m, total: Math.round(totalT) }));
-        console.log(`⏱ Scene fully loaded: ${Math.round(totalT)}ms`);
-      } catch (e) {
-        console.error('Environment data failed:', e);
-        setSceneReady(true); // don't block on failure
-      }
-    };
-
-    loadEnvironment();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [txPosition[0], txPosition[1], radius, mapReady, darkMode]);
 
   // Toggle trees visibility (Three.js custom layer)
   useEffect(() => {
@@ -951,11 +812,9 @@ export const MapView = React.memo(function MapView({
     if (!map) return;
     try {
       const vis = showVegetation ? 'visible' : 'none';
-      try {
-        if (map.getLayer('trees-3d')) map.setLayoutProperty('trees-3d', 'visibility', vis);
-        if (map.getLayer('trees-trunk')) map.setLayoutProperty('trees-trunk', 'visibility', vis);
-      } catch(_) {}
-    } catch (_) { /* layers may not exist yet */ }
+      if (map.getLayer('trees-canopy')) map.setLayoutProperty('trees-canopy', 'visibility', vis);
+      if (map.getLayer('trees-trunk')) map.setLayoutProperty('trees-trunk', 'visibility', vis);
+    } catch (_) {}
   }, [showVegetation, mapReady]);
 
   // Toggle roads visibility
