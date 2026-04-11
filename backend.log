@@ -63,3 +63,53 @@ INFO:     127.0.0.1:49684 - "GET /api/health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49686 - "GET /api/health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51436 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51434 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+2026-04-11 11:43:46,026 [INFO] backend.app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 2 tiles (21L14SE, 21L14SO), res=5.1m
+2026-04-11 11:43:46,126 [INFO] backend.app.terrain.lidar_terrain: LiDAR read_block: 2000x2000 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=10.0m
+2026-04-11 11:43:47,509 [INFO] backend.app.main: Building mask: 807555 of 4000000 pixels masked (20.2%)
+2026-04-11 11:43:47,746 [INFO] backend.app.main: Tree detection: 119101 trees found in 10.0km radius
+INFO:     127.0.0.1:61016 - "GET /api/data/environment?lat=46.82349&lon=-71.23327&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61250 - "GET /api/data/environment?lat=46.830273&lon=-71.226608&radius_km=10 HTTP/1.1" 200 OK
+2026-04-11 11:44:05,806 [INFO] backend.app.main: Buildings cached: C:\Users\franc\OneDrive\Documents\GitHub\RF-analysis\backend\app\..\..\data\output\buildings_cache\buildings_46.82_-71.23_10.0.json (208602 features)
+INFO:     127.0.0.1:61014 - "GET /api/data/buildings?lat=46.82349&lon=-71.23327&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59896 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59898 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59902 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59901 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54375 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54377 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54381 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54380 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+2026-04-11 14:32:00,358 [INFO] backend.app.terrain.lidar_terrain: LiDAR read_block: 666x666 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=30.0m
+2026-04-11 14:32:00,525 [INFO] backend.app.terrain.lidar_terrain: LiDAR read_block: 666x666 px, 4 tiles (21L14NE, 21L14NO, 21L14SE, 21L14SO), res=30.0m
+2026-04-11 14:32:00,527 [INFO] backend.app.coverage.engine: Coverage: 666x666 @ 30m | Terrain: 666x666 [LiDAR] +MHC clutter 330ms
+2026-04-11 14:32:00,590 [INFO] backend.app.coverage.engine:   Local roughness: 12ms (dh median=2.7m, p95=8.4m)
+2026-04-11 14:32:00,594 [INFO] backend.app.coverage.engine:   Diffraction (CUDA, per-pixel): 4ms
+2026-04-11 14:32:00,595 [INFO] backend.app.coverage.engine:   Link budget + mask: 68ms
+2026-04-11 14:32:00,729 [INFO] backend.app.coverage.engine:   Render: 134ms | TOTAL: 651ms | Coverage: 53.7%
+INFO:     127.0.0.1:53347 - "POST /api/area HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58836 - "POST /api/coverage/sample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54554 - "GET /api/coverage/tiles/10/309/360.png?t=1775932320741 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56932 - "POST /api/coverage/sample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60651 - "POST /api/coverage/sample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64097 - "POST /api/coverage/sample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62847 - "POST /api/coverage/sample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64431 - "GET /api/coverage/tiles/10/309/361.png?t=1775932320741 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52467 - "GET /api/coverage/tiles/10/309/361.png?t=1775932552904 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52466 - "GET /api/coverage/tiles/10/309/360.png?t=1775932552904 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56310 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56312 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56316 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56315 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50885 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55727 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56654 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56653 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51728 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61813 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50607 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59743 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52363 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52409 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60075 - "GET /api/data/environment?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60074 - "GET /api/data/buildings?lat=46.83035&lon=-71.227008&radius_km=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52157 - "GET /api/health HTTP/1.1" 200 OK

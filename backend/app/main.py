@@ -26,6 +26,44 @@ from .gpu import gpu_status
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# --- Performance metrics ---
+_metrics: dict = {
+    "requests": [],       # last N request timings
+    "totals": {           # cumulative stats
+        "buildings_requests": 0,
+        "buildings_avg_ms": 0,
+        "trees_requests": 0,
+        "trees_avg_ms": 0,
+        "coverage_requests": 0,
+        "coverage_avg_ms": 0,
+    },
+}
+_MAX_METRICS_HISTORY = 50
+
+
+def _record_metric(endpoint: str, duration_ms: float, details: dict = None):
+    """Record a request timing metric."""
+    entry = {
+        "endpoint": endpoint,
+        "ms": round(duration_ms, 1),
+        "ts": time.time(),
+    }
+    if details:
+        entry.update(details)
+    _metrics["requests"].append(entry)
+    if len(_metrics["requests"]) > _MAX_METRICS_HISTORY:
+        _metrics["requests"] = _metrics["requests"][-_MAX_METRICS_HISTORY:]
+    # Update running averages
+    key = endpoint.replace("/api/data/", "").replace("/api/", "")
+    req_key = f"{key}_requests"
+    avg_key = f"{key}_avg_ms"
+    if req_key in _metrics["totals"]:
+        n = _metrics["totals"][req_key]
+        old_avg = _metrics["totals"][avg_key]
+        _metrics["totals"][req_key] = n + 1
+        _metrics["totals"][avg_key] = round((old_avg * n + duration_ms) / (n + 1), 1)
+
+
 # Data directories
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "data"))
 SRTM_DIR = os.path.join(DATA_DIR, "srtm")
@@ -937,15 +975,19 @@ def get_buildings_binary(lat: float, lon: float, radius_km: float = 2.0):
 
 @app.get("/api/data/buildings")
 def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
-    """Get building footprints near a point (local data + OSM). Cached to disk."""
+    """Get building footprints near a point (local data). Cached to disk."""
     import json
+    t0 = time.time()
 
     # Check disk cache first (key: rounded position + radius)
     cache_key_str = f"{round(lat,2)}_{round(lon,2)}_{round(radius_km,1)}"
     cache_path = os.path.join(BUILDINGS_CACHE_DIR, f"buildings_{cache_key_str}.json")
     if os.path.exists(cache_path):
         with open(cache_path) as f:
-            return json.load(f)
+            data = json.load(f)
+        _record_metric("buildings", (time.time() - t0) * 1000,
+                       {"features": len(data.get("features", [])), "cached": True})
+        return data
 
     local_data = _load_local_buildings()
 
@@ -1099,11 +1141,13 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
     except Exception as e:
         logger.warning(f"Failed to cache buildings: {e}")
 
+    _record_metric("buildings", (time.time() - t0) * 1000,
+                   {"features": len(filtered), "cached": False})
     return result
 
 
 # ---------------------------------------------------------------------------
-# Individual trees from LiDAR MHC + roads from OSM (for 3-D rendering)
+# Individual trees from LiDAR MHC (for 3-D rendering)
 # ---------------------------------------------------------------------------
 _env_cache: dict = {}
 
@@ -1243,11 +1287,13 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
 
 @app.get("/api/data/environment")
 def get_environment(lat: float, lon: float, radius_km: float = 2.0):
-    """Get individual trees (from LiDAR) and roads (from OSM) for 3D rendering."""
+    """Get individual trees (from LiDAR) for 3D rendering."""
+    t0 = time.time()
     radius_km = min(radius_km, 10.0)  # cap for performance
     cache_key = f"{round(lat,3)}_{round(lon,3)}_{round(radius_km,1)}"
 
     if cache_key in _env_cache:
+        _record_metric("trees", (time.time() - t0) * 1000, {"cached": True})
         return _env_cache[cache_key]
 
     # Get building features to exclude from tree detection (use local data only, no Overpass)
@@ -1277,5 +1323,7 @@ def get_environment(lat: float, lon: float, radius_km: float = 2.0):
         "counts": {"trees": len(trees)},
     }
 
+    _record_metric("trees", (time.time() - t0) * 1000,
+                   {"trees": len(trees), "cached": False})
     _env_cache[cache_key] = result
     return result

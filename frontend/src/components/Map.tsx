@@ -121,6 +121,9 @@ export const MapView = React.memo(function MapView({
   const [showVegetation, setShowVegetation] = useState(true);
   const [showRoads, setShowRoads] = useState(true);
   const [mapReady, setMapReady] = useState(0); // increment to signal map created
+  const [sceneReady, setSceneReady] = useState(false); // all layers loaded
+  const [loadMetrics, setLoadMetrics] = useState<Record<string, number>>({});
+  const loadStartRef = useRef(performance.now());
 
   onMapClickRef.current = onMapClick;
 
@@ -158,7 +161,269 @@ export const MapView = React.memo(function MapView({
 
       // 3D terrain extrusion via style (not setTerrain API)
       style.terrain = { source: 'terrain-dem', exaggeration: 1.5 };
-      style.sky = {};
+      // No sky/fog — clean 3D view
+      delete style.sky;
+      delete style.fog;
+
+      // --- Build complete 3D city model from CARTO vector tiles ---
+      const cartoSource = Object.keys(style.sources).find(
+        (k: string) => style.sources[k].type === 'vector'
+      );
+      console.log('CARTO source:', cartoSource);
+
+      if (cartoSource) {
+        // Hide original CARTO fill/line layers — keep symbol layers (street names, place names)
+        for (const layer of style.layers) {
+          const sl = layer['source-layer'];
+          if (!sl) continue;
+          // Never hide symbol layers (labels) or transportation_name
+          if (layer.type === 'symbol') continue;
+          if (['water', 'waterway', 'landuse', 'landcover', 'transportation', 'building'].includes(sl)) {
+            layer.paint = { ...layer.paint, [`${layer.type}-opacity`]: 0 };
+          }
+        }
+
+        // Default ground color (grass everywhere — no empty zones)
+        style.layers.push({
+          id: 'ground-base',
+          type: 'background',
+          paint: {
+            'background-color': darkMode ? '#1e3a1e' : '#7caa5a',
+          },
+        });
+
+        // --- LANDCOVER: natural surfaces ---
+        style.layers.push({
+          id: 'landcover-3d',
+          type: 'fill',
+          source: cartoSource,
+          'source-layer': 'landcover',
+          paint: {
+            'fill-color': [
+              'match', ['get', 'class'],
+              'wood', darkMode ? '#1b3d1b' : '#5a9e4a',
+              'farmland', darkMode ? '#2a3d1a' : '#b8cc6a',
+              'ice', '#e8f0f8',
+              darkMode ? '#1e3a1e' : '#7caa5a', // grass default
+            ],
+            'fill-opacity': 0.8,
+          },
+        });
+
+        // --- LANDUSE: parks, residential, industrial, commercial ---
+        style.layers.push({
+          id: 'landuse-3d',
+          type: 'fill',
+          source: cartoSource,
+          'source-layer': 'landuse',
+          paint: {
+            'fill-color': [
+              'match', ['get', 'class'],
+              'grass', darkMode ? '#1e4a1e' : '#8bc34a',
+              'park', darkMode ? '#1e4a1e' : '#81c784',
+              'garden', darkMode ? '#1e4a1e' : '#8bc34a',
+              'cemetery', darkMode ? '#2a3d2a' : '#a5c88a',
+              'residential', darkMode ? '#252525' : '#d5dbb3',
+              'industrial', darkMode ? '#2a2520' : '#c8bfb0',
+              'commercial', darkMode ? '#2a2525' : '#d4c8b8',
+              darkMode ? '#1e3a1e' : '#7caa5a',
+            ],
+            'fill-opacity': 0.7,
+          },
+        });
+
+        // --- WATER: rivers, lakes (flat fill, draped on terrain) ---
+        style.layers.push({
+          id: 'water-3d',
+          type: 'fill',
+          source: cartoSource,
+          'source-layer': 'water',
+          paint: {
+            'fill-color': darkMode ? '#0d2847' : '#4da8da',
+            'fill-opacity': 0.85,
+          },
+        });
+
+        // Waterways (streams, canals)
+        style.layers.push({
+          id: 'waterway-3d',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'waterway',
+          layout: { 'line-cap': 'round' },
+          paint: {
+            'line-color': darkMode ? '#0d2847' : '#4da8da',
+            'line-width': [
+              'interpolate', ['linear'], ['zoom'],
+              10, ['match', ['get', 'class'], 'river', 2, 1],
+              16, ['match', ['get', 'class'], 'river', 8, 'canal', 5, 3],
+            ],
+            'line-opacity': 0.8,
+          },
+        });
+
+        // --- ROADS: realistic widths ---
+        // Widths in pixels that scale with zoom to approximate real meters.
+        // At zoom 16: 1px ≈ 2.4m. Road widths (total with sidewalks):
+        // motorway ~24m, trunk ~18m, primary ~14m, secondary ~10m, tertiary ~9m, minor ~8m, service ~6m
+        // Match roads that are NOT tunnels: either no brunnel property, or brunnel != tunnel
+        const roadFilter = ['all',
+          ['any', ['!has', 'brunnel'], ['!=', 'brunnel', 'tunnel']],
+          ['!=', 'class', 'rail'], ['!=', 'class', 'path']];
+
+        // Layer 1: Sidewalk + curb (outermost, light gray)
+        style.layers.push({
+          id: 'road-sidewalk',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: roadFilter,
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          minzoom: 11,
+          paint: {
+            'line-color': darkMode ? '#3a3a3a' : '#b0b0a8',
+            'line-width': [
+              'interpolate', ['exponential', 2], ['zoom'],
+              11, 1,
+              13, ['match', ['get', 'class'], 'motorway', 6, 'trunk', 5, 'primary', 4, 'secondary', 3.5, 'tertiary', 3, 'minor', 3, 'service', 2.5, 2.5],
+              16, ['match', ['get', 'class'], 'motorway', 22, 'trunk', 18, 'primary', 14, 'secondary', 11, 'tertiary', 10, 'minor', 9, 'service', 7, 7],
+              20, ['match', ['get', 'class'], 'motorway', 180, 'trunk', 140, 'primary', 110, 'secondary', 85, 'tertiary', 76, 'minor', 72, 'service', 56, 56],
+            ],
+            'line-opacity': 0.9,
+          },
+        });
+
+        // Layer 2: Asphalt surface (dark, narrower than sidewalk)
+        style.layers.push({
+          id: 'road-asphalt',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: roadFilter,
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          minzoom: 11,
+          paint: {
+            'line-color': darkMode ? '#252525' : '#505050',
+            'line-width': [
+              'interpolate', ['exponential', 2], ['zoom'],
+              11, 0.5,
+              13, ['match', ['get', 'class'], 'motorway', 5, 'trunk', 4, 'primary', 3, 'secondary', 2.5, 'tertiary', 2, 'minor', 2, 'service', 1.5, 1.5],
+              16, ['match', ['get', 'class'], 'motorway', 18, 'trunk', 14, 'primary', 11, 'secondary', 8, 'tertiary', 7, 'minor', 7, 'service', 5, 5],
+              20, ['match', ['get', 'class'], 'motorway', 150, 'trunk', 114, 'primary', 90, 'secondary', 66, 'tertiary', 58, 'minor', 54, 'service', 42, 42],
+            ],
+            'line-opacity': 0.95,
+          },
+        });
+
+        // Layer 3: Center line (yellow for arterials, white for local)
+        style.layers.push({
+          id: 'road-center-line',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['all', ['!=', 'brunnel', 'tunnel'], ['!=', 'class', 'rail'], ['!=', 'class', 'path'],
+                   ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary', 'tertiary']],
+          layout: { 'line-cap': 'butt' },
+          minzoom: 15,
+          paint: {
+            'line-color': ['match', ['get', 'class'], 'motorway', '#ffcc00', 'trunk', '#ffcc00', 'primary', '#ffcc00', '#ffffff'],
+            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 15, 0.3, 18, 1.2, 20, 5],
+            'line-dasharray': [6, 4],
+            'line-opacity': 0.8,
+          },
+        });
+
+        // Layer 4: Edge lines (white on both sides of major roads)
+        style.layers.push({
+          id: 'road-edge-lines',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['all', ['!=', 'brunnel', 'tunnel'],
+                   ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary']],
+          layout: { 'line-cap': 'butt' },
+          minzoom: 15,
+          paint: {
+            'line-color': '#ffffff',
+            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 15, 0.2, 18, 0.8, 20, 3],
+            'line-gap-width': [
+              'interpolate', ['exponential', 2], ['zoom'],
+              15, ['match', ['get', 'class'], 'motorway', 4, 'trunk', 3, 'primary', 2.5, 2],
+              18, ['match', ['get', 'class'], 'motorway', 22, 'trunk', 16, 'primary', 13, 9],
+              20, ['match', ['get', 'class'], 'motorway', 120, 'trunk', 88, 'primary', 72, 50],
+            ],
+            'line-opacity': 0.5,
+          },
+        });
+
+        // Paths / sidewalks standalone
+        style.layers.push({
+          id: 'road-paths',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['==', 'class', 'path'],
+          layout: { 'line-cap': 'round' },
+          minzoom: 14,
+          paint: {
+            'line-color': darkMode ? '#4a4a3a' : '#c8b898',
+            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 14, 0.5, 18, 4],
+            'line-opacity': 0.7,
+          },
+        });
+
+        // Rail
+        style.layers.push({
+          id: 'rail-3d',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['==', 'class', 'rail'],
+          layout: { 'line-cap': 'butt' },
+          paint: {
+            'line-color': darkMode ? '#666666' : '#777777',
+            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 10, 0.5, 18, 5],
+            'line-dasharray': [4, 2],
+            'line-opacity': 0.8,
+          },
+        });
+
+        // --- BRIDGES: wider with guardrails ---
+        style.layers.push({
+          id: 'bridge-edge',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['==', 'brunnel', 'bridge'],
+          layout: { 'line-cap': 'butt', 'line-join': 'miter' },
+          paint: {
+            'line-color': darkMode ? '#555555' : '#888888',
+            'line-width': [
+              'interpolate', ['exponential', 2], ['zoom'],
+              11, ['match', ['get', 'class'], 'motorway', 3, 'trunk', 2.5, 'primary', 2, 1.5],
+              18, ['match', ['get', 'class'], 'motorway', 38, 'trunk', 30, 'primary', 24, 16],
+            ],
+            'line-opacity': 0.95,
+          },
+        });
+        style.layers.push({
+          id: 'bridge-surface',
+          type: 'line',
+          source: cartoSource,
+          'source-layer': 'transportation',
+          filter: ['==', 'brunnel', 'bridge'],
+          layout: { 'line-cap': 'butt', 'line-join': 'miter' },
+          paint: {
+            'line-color': darkMode ? '#333333' : '#a0a0a0',
+            'line-width': [
+              'interpolate', ['exponential', 2], ['zoom'],
+              11, ['match', ['get', 'class'], 'motorway', 2.5, 'trunk', 2, 'primary', 1.5, 1],
+              18, ['match', ['get', 'class'], 'motorway', 32, 'trunk', 24, 'primary', 20, 12],
+            ],
+            'line-opacity': 0.95,
+          },
+        });
+      }
 
       // Hillshade under all layers
       style.layers.unshift({
@@ -210,7 +475,12 @@ export const MapView = React.memo(function MapView({
       markerRef.current = marker;
       mapRef.current = map;
       // Signal other effects once the map is fully loaded
-      map.once('idle', () => setMapReady(n => n + 1));
+      map.once('idle', () => {
+        const t = performance.now() - loadStartRef.current;
+        setLoadMetrics(m => ({ ...m, map: Math.round(t) }));
+        console.log(`⏱ Map base loaded: ${Math.round(t)}ms`);
+        setMapReady(n => n + 1);
+      });
 
       // Middle-mouse-button drag = rotate + pitch (3D navigation)
       const canvas = map.getCanvas();
@@ -464,7 +734,9 @@ export const MapView = React.memo(function MapView({
         });
         setBuildingsLoaded(true);
         lastBuildingsLoad.current = { lat, lon, radius: buildingsRadius };
-        console.log(`3D buildings loaded: ${features.length} features`);
+        const t = performance.now() - loadStartRef.current;
+        setLoadMetrics(m => ({ ...m, buildings: Math.round(t) }));
+        console.log(`⏱ 3D buildings loaded: ${features.length} features (${Math.round(t)}ms)`);
       } catch (e) {
         console.error('3D buildings failed:', e);
       }
@@ -651,12 +923,20 @@ export const MapView = React.memo(function MapView({
             },
           });
 
-          console.log(`3D trees: ${canopyFeatures.length} canopies + trunks`);
+          const t = performance.now() - loadStartRef.current;
+          setLoadMetrics(m => ({ ...m, trees: Math.round(t) }));
+          console.log(`⏱ 3D trees: ${canopyFeatures.length} (${Math.round(t)}ms)`);
         }
 
         lastEnvLoad.current = { lat, lon, radius: envRadius };
+        // Mark scene as ready once trees are loaded (last heavy layer)
+        setSceneReady(true);
+        const totalT = performance.now() - loadStartRef.current;
+        setLoadMetrics(m => ({ ...m, total: Math.round(totalT) }));
+        console.log(`⏱ Scene fully loaded: ${Math.round(totalT)}ms`);
       } catch (e) {
         console.error('Environment data failed:', e);
+        setSceneReady(true); // don't block on failure
       }
     };
 
@@ -696,6 +976,21 @@ export const MapView = React.memo(function MapView({
   return (
     <div className="flex-1 relative overflow-hidden">
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+
+      {/* Loading overlay — hides map until all layers are loaded */}
+      {!sceneReady && (
+        <div className="absolute inset-0 z-50 bg-surface-1 flex flex-col items-center justify-center gap-4">
+          <div className="w-10 h-10 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
+          <div className="text-sm text-gray-400 space-y-1 text-center">
+            <div>{fr ? 'Chargement du modèle 3D...' : 'Loading 3D model...'}</div>
+            <div className="text-xs text-gray-500 font-mono space-y-0.5">
+              {loadMetrics.map ? <div>Carte: {loadMetrics.map}ms</div> : <div>Carte...</div>}
+              {loadMetrics.buildings ? <div>Bâtiments: {loadMetrics.buildings}ms</div> : mapReady > 0 ? <div>Bâtiments...</div> : null}
+              {loadMetrics.trees ? <div>Arbres: {loadMetrics.trees}ms</div> : loadMetrics.buildings ? <div>Arbres...</div> : null}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Layer control buttons — stopPropagation prevents clicks reaching the map */}
       <div
@@ -815,16 +1110,24 @@ export const MapView = React.memo(function MapView({
       </div>
 
       {/* Stats overlay */}
-      {coverageResult && (
-        <div className="absolute bottom-8 right-2 bg-surface-2/90 backdrop-blur-sm px-3 py-2 rounded-lg text-[11px] font-mono text-gray-400 border border-gray-700/50 pointer-events-none z-10 space-y-0.5">
-          <div>ERP: <span className="text-brand-400">{coverageResult.erp_w.toFixed(3)}W</span> / {coverageResult.erp_dbm.toFixed(1)}dBm</div>
-          <div>EIRP: <span className="text-brand-400">{coverageResult.eirp_w.toFixed(3)}W</span> / {coverageResult.eirp_dbm.toFixed(1)}dBm</div>
-          <div>{fr ? 'Temps' : 'Time'}: {coverageResult.computation_time_ms.toFixed(0)}ms</div>
-          {coverageResult.stats.resolution_m && (
-            <div>Res: {coverageResult.stats.resolution_m}m ({coverageResult.stats.megapixels} MP)</div>
-          )}
-        </div>
-      )}
+      <div className="absolute bottom-8 right-2 bg-surface-2/90 backdrop-blur-sm px-3 py-2 rounded-lg text-[11px] font-mono text-gray-400 border border-gray-700/50 pointer-events-none z-10 space-y-0.5">
+        {coverageResult && (
+          <>
+            <div>ERP: <span className="text-brand-400">{coverageResult.erp_w.toFixed(3)}W</span> / {coverageResult.erp_dbm.toFixed(1)}dBm</div>
+            <div>EIRP: <span className="text-brand-400">{coverageResult.eirp_w.toFixed(3)}W</span> / {coverageResult.eirp_dbm.toFixed(1)}dBm</div>
+            <div>{fr ? 'Temps' : 'Time'}: {coverageResult.computation_time_ms.toFixed(0)}ms</div>
+            {coverageResult.stats.resolution_m && (
+              <div>Res: {coverageResult.stats.resolution_m}m ({coverageResult.stats.megapixels} MP)</div>
+            )}
+          </>
+        )}
+        {loadMetrics.total && (
+          <div className="border-t border-gray-700/30 pt-0.5 mt-0.5">
+            3D: {(loadMetrics.total / 1000).toFixed(1)}s
+            <span className="text-gray-500"> (map {((loadMetrics.map || 0) / 1000).toFixed(1)}s + bldg {(((loadMetrics.buildings || 0) - (loadMetrics.map || 0)) / 1000).toFixed(1)}s + trees {(((loadMetrics.trees || 0) - (loadMetrics.buildings || 0)) / 1000).toFixed(1)}s)</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 });
