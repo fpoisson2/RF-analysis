@@ -299,15 +299,16 @@ def coverage_raster_tile(z: int, x: int, y: int):
             pil_vals = pil_vals.resize((dst_w, dst_h), _Image.BILINEAR)
             upscaled = np.array(pil_vals)
 
-            # Vectorized colorization using the same color stops
+            # Vectorized colorization using the same color stops as the engine
             from .coverage.engine import COLOR_SCHEMAS
-            stops = COLOR_SCHEMAS.get("dBm", [])
+            schema = COLOR_SCHEMAS.get("signal_strength", {})
+            stops = schema.get("stops", [])
             valid = upscaled > -998
             region_tile = np.zeros((dst_h, dst_w, 4), dtype=np.uint8)
             # Apply colors from strongest to weakest (first match wins)
             for threshold, rgba in stops:
                 mask = valid & (upscaled >= threshold)
-                region_tile[mask] = list(rgba)
+                region_tile[mask] = rgba
                 valid = valid & ~mask  # don't overwrite
 
             tile[dst_y0:dst_y0+dst_h, dst_x0:dst_x0+dst_w] = region_tile

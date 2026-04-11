@@ -303,9 +303,11 @@ export const MapView = React.memo(function MapView({
       // We want pixels_per_tile >= 512, so z <= log2(360 / (pixelDeg * 512))
       const optimalMaxZoom = Math.min(15, Math.max(10, Math.floor(Math.log2(360 / (pixelDeg * 512)))));
 
+      // Cache-buster: unique timestamp per coverage result forces tile reload
+      const cacheBuster = Date.now();
       map.addSource('coverage-source', {
         type: 'raster',
-        tiles: [window.location.origin + '/api/coverage/tiles/{z}/{x}/{y}.png'],
+        tiles: [window.location.origin + `/api/coverage/tiles/{z}/{x}/{y}.png?t=${cacheBuster}`],
         tileSize: 512,
         bounds: [west, south, east, north],
         minzoom: 8,
