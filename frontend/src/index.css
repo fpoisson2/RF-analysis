@@ -1,5 +1,5 @@
-/* MapLibre GL CSS - must be before tailwind */
-@import 'maplibre-gl/dist/maplibre-gl.css';
+/* CesiumJS widget CSS */
+@import 'cesium/Build/Cesium/Widgets/widgets.css';
 
 @tailwind base;
 @tailwind components;

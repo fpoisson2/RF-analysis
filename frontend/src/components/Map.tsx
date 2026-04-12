@@ -1,8 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
-import maplibregl from 'maplibre-gl';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as Cesium from 'cesium';
 import { AreaResponse } from '../types';
 import { Locale, t } from '../i18n';
 import { Layers, Mountain, TreePine, Building2, X, Box, Route } from 'lucide-react';
+import { createCesiumViewer, swapBaseImagery, destroyCesiumViewer } from './cesium/CesiumViewer';
+import { addCoverageLayer, removeCoverageLayer } from './cesium/CoverageLayer';
+import { addTerrainOverlay, removeTerrainOverlay } from './cesium/TerrainOverlayLayer';
+import { createTxMarker, updateTxMarkerPosition, TxMarkerHandle } from './cesium/TxMarker';
+import { parseScene, shouldReloadScene, ParsedBuilding, ParsedScene } from './cesium/SceneLoader';
+import { createBuildingPrimitives, recolorBuildings, BuildingPrimitives } from './cesium/BuildingsMesh';
+import { createTreePrimitives, TreePrimitives } from './cesium/TreesMesh';
+import { sampleBuildingSignals } from './cesium/CoverageColoring';
 
 interface MapProps {
   onMapClick: (lat: number, lon: number) => void;
@@ -17,31 +25,30 @@ interface MapProps {
   radius: number;
 }
 
-// Color legend stops - CloudRF-style rainbow (red=strong, blue=weak).
-// MUST stay in sync with backend engine.py COLOR_SCHEMAS.
+// Color legend stops — must stay in sync with backend engine.py COLOR_SCHEMAS.
 const COLOR_STOPS: Record<string, { label: string; stops: [number, string][] }> = {
   dBm: {
     label: 'dBm',
     stops: [
-      [-30, '#ff1e1e'],   // Excellent - bright red
+      [-30, '#ff1e1e'],
       [-40, '#ff3c00'],
-      [-50, '#ff6e00'],   // Very good - red-orange
+      [-50, '#ff6e00'],
       [-55, '#ff9600'],
-      [-60, '#ffbe00'],   // Good - amber
+      [-60, '#ffbe00'],
       [-65, '#ffe100'],
-      [-70, '#dcf000'],   // Fair - yellow-green
+      [-70, '#dcf000'],
       [-75, '#aaf000'],
-      [-80, '#64e114'],   // Weak - green
+      [-80, '#64e114'],
       [-85, '#1ec83c'],
-      [-90, '#00b478'],   // Very weak - teal-green
+      [-90, '#00b478'],
       [-95, '#00a0b4'],
-      [-100, '#0082d2'],  // Marginal - cyan-blue
+      [-100, '#0082d2'],
       [-105, '#0a5adc'],
-      [-110, '#283cc8'],  // Poor - deep blue
+      [-110, '#283cc8'],
       [-115, '#461eaa'],
-      [-120, '#500a8c'],  // Very poor - violet
+      [-120, '#500a8c'],
       [-125, '#46006e'],
-      [-130, '#320050'],  // Near noise - dark purple
+      [-130, '#320050'],
     ],
   },
   dB: {
@@ -83,613 +90,196 @@ const COLOR_STOPS: Record<string, { label: string; stops: [number, string][] }> 
   },
 };
 
-// Antenna SVG marker
-function createTxMarkerElement(): HTMLDivElement {
-  const el = document.createElement('div');
-  el.style.cssText = 'cursor:grab;width:40px;height:50px;';
-  el.innerHTML = `
-    <svg viewBox="0 0 40 50" width="40" height="50" xmlns="http://www.w3.org/2000/svg">
-      <ellipse cx="20" cy="48" rx="6" ry="2" fill="rgba(0,0,0,0.3)"/>
-      <line x1="20" y1="15" x2="20" y2="45" stroke="#f97316" stroke-width="3" stroke-linecap="round"/>
-      <line x1="20" y1="45" x2="12" y2="48" stroke="#f97316" stroke-width="2" stroke-linecap="round"/>
-      <line x1="20" y1="45" x2="28" y2="48" stroke="#f97316" stroke-width="2" stroke-linecap="round"/>
-      <line x1="15" y1="30" x2="20" y2="25" stroke="#f97316" stroke-width="1.5"/>
-      <line x1="25" y1="30" x2="20" y2="25" stroke="#f97316" stroke-width="1.5"/>
-      <path d="M 25 12 Q 30 8 25 4" stroke="#fbbf24" stroke-width="1.5" fill="none" opacity="0.8"/>
-      <path d="M 28 15 Q 35 8 28 1" stroke="#fbbf24" stroke-width="1.5" fill="none" opacity="0.5"/>
-      <path d="M 15 12 Q 10 8 15 4" stroke="#fbbf24" stroke-width="1.5" fill="none" opacity="0.8"/>
-      <path d="M 12 15 Q 5 8 12 1" stroke="#fbbf24" stroke-width="1.5" fill="none" opacity="0.5"/>
-      <circle cx="20" cy="14" r="3" fill="#f97316" stroke="white" stroke-width="1.5"/>
-    </svg>`;
-  return el;
-}
-
 export const MapView = React.memo(function MapView({
   onMapClick, txPosition, coverageResult, darkMode, locale, outputUnits,
   terrainLayer, onTerrainLayerChange, hasLidar, radius,
 }: MapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const coordsRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<maplibregl.Map | null>(null);
-  const markerRef = useRef<maplibregl.Marker | null>(null);
-  const cleanupRef = useRef<(() => void) | null>(null);
+  const viewerRef = useRef<Cesium.Viewer | null>(null);
+  const markerRef = useRef<TxMarkerHandle | null>(null);
   const onMapClickRef = useRef(onMapClick);
+
   const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const [loadingTerrain, setLoadingTerrain] = useState(false);
   const [view3D, setView3D] = useState(false);
-  const [buildingsLoaded, setBuildingsLoaded] = useState(false);
   const [showVegetation, setShowVegetation] = useState(true);
   const [showRoads, setShowRoads] = useState(true);
-  const [mapReady, setMapReady] = useState(0); // increment to signal map created
-  const [sceneReady, setSceneReady] = useState(false); // all layers loaded
+  const [viewerReady, setViewerReady] = useState(0);
+  const [sceneReady, setSceneReady] = useState(false);
   const [loadMetrics, setLoadMetrics] = useState<Record<string, number>>({});
   const loadStartRef = useRef(performance.now());
 
-  onMapClickRef.current = onMapClick;
+  // Persistent refs for scene data
+  const buildingPrimRef = useRef<BuildingPrimitives | null>(null);
+  const treePrimRef = useRef<TreePrimitives | null>(null);
+  const parsedBuildingsRef = useRef<ParsedBuilding[]>([]);
+  const lastSceneLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
+  const darkModeRef = useRef(darkMode);
 
-  // Initialize map
+  onMapClickRef.current = onMapClick;
+  darkModeRef.current = darkMode;
+
+  // Initialize CesiumJS viewer
   useEffect(() => {
     if (!containerRef.current) return;
-    let cancelled = false;
 
-    const demTilesUrl = window.location.origin + '/api/terrain/dem/{z}/{x}/{y}.png';
-    const cartoStyleUrl = darkMode
-      ? 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
-      : 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json';
-
-    // Fetch CARTO style, inject DEM + terrain, then create map
-    fetch(cartoStyleUrl).then(r => r.json()).catch(() => ({
-      version: 8, sources: {}, layers: [],
-    })).then((style: any) => {
-      if (cancelled || !containerRef.current) return;
-
-      // Inject DEM sources — AWS Terrarium tiles (fast CDN, global coverage)
-      style.sources['terrain-dem'] = {
-        type: 'raster-dem',
-        tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-        encoding: 'terrarium',
-        tileSize: 256,
-        maxzoom: 15,
-      };
-      style.sources['hillshade-dem'] = {
-        type: 'raster-dem',
-        tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-        encoding: 'terrarium',
-        tileSize: 256,
-        maxzoom: 15,
-      };
-
-      // 3D terrain extrusion via style (not setTerrain API)
-      style.terrain = { source: 'terrain-dem', exaggeration: 1.5 };
-      // No sky/fog — just clean background
-      delete style.sky;
-      delete style.fog;
-
-      // Summer sun lighting — casts shadows on buildings and trees
-      style.light = {
-        anchor: 'viewport',
-        color: '#fffde8',
-        intensity: 0.6,
-        position: [1.5, 210, 30],  // [radial, azimuth, polar] — sun from south-southwest, 30° elevation (summer afternoon)
-      };
-
-      // --- Build complete 3D city model from CARTO vector tiles ---
-      const cartoSource = Object.keys(style.sources).find(
-        (k: string) => style.sources[k].type === 'vector'
-      );
-      console.log('CARTO source:', cartoSource);
-
-      if (cartoSource) {
-        // Hide original CARTO fill/line layers — keep symbol layers (street names, place names)
-        for (const layer of style.layers) {
-          const sl = layer['source-layer'];
-          if (!sl) continue;
-          // Never hide symbol layers (labels) or transportation_name
-          if (layer.type === 'symbol') continue;
-          if (['water', 'waterway', 'landuse', 'landcover', 'transportation', 'building'].includes(sl)) {
-            layer.paint = { ...layer.paint, [`${layer.type}-opacity`]: 0 };
-          }
-        }
-
-        // Default ground color (grass everywhere — no empty zones)
-        style.layers.push({
-          id: 'ground-base',
-          type: 'background',
-          paint: {
-            'background-color': darkMode ? '#1e3a1e' : '#7caa5a',
-          },
-        });
-
-        // --- LANDCOVER: natural surfaces ---
-        style.layers.push({
-          id: 'landcover-3d',
-          type: 'fill',
-          source: cartoSource,
-          'source-layer': 'landcover',
-          paint: {
-            'fill-color': [
-              'match', ['get', 'class'],
-              'wood', darkMode ? '#1b3d1b' : '#5a9e4a',
-              'farmland', darkMode ? '#2a3d1a' : '#b8cc6a',
-              'ice', '#e8f0f8',
-              darkMode ? '#1e3a1e' : '#7caa5a', // grass default
-            ],
-            'fill-opacity': 0.8,
-          },
-        });
-
-        // --- LANDUSE: parks, residential, industrial, commercial ---
-        style.layers.push({
-          id: 'landuse-3d',
-          type: 'fill',
-          source: cartoSource,
-          'source-layer': 'landuse',
-          paint: {
-            'fill-color': [
-              'match', ['get', 'class'],
-              'grass', darkMode ? '#1e4a1e' : '#8bc34a',
-              'park', darkMode ? '#1e4a1e' : '#81c784',
-              'garden', darkMode ? '#1e4a1e' : '#8bc34a',
-              'cemetery', darkMode ? '#2a3d2a' : '#a5c88a',
-              'residential', darkMode ? '#252525' : '#d5dbb3',
-              'industrial', darkMode ? '#2a2520' : '#c8bfb0',
-              'commercial', darkMode ? '#2a2525' : '#d4c8b8',
-              darkMode ? '#1e3a1e' : '#7caa5a',
-            ],
-            'fill-opacity': 0.7,
-          },
-        });
-
-        // --- WATER: rivers, lakes (flat fill, draped on terrain) ---
-        style.layers.push({
-          id: 'water-3d',
-          type: 'fill',
-          source: cartoSource,
-          'source-layer': 'water',
-          paint: {
-            'fill-color': darkMode ? '#0d2847' : '#4da8da',
-            'fill-opacity': 0.85,
-          },
-        });
-
-        // Waterways (streams, canals)
-        style.layers.push({
-          id: 'waterway-3d',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'waterway',
-          layout: { 'line-cap': 'round' },
-          paint: {
-            'line-color': darkMode ? '#0d2847' : '#4da8da',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              10, ['match', ['get', 'class'], 'river', 2, 1],
-              16, ['match', ['get', 'class'], 'river', 8, 'canal', 5, 3],
-            ],
-            'line-opacity': 0.8,
-          },
-        });
-
-        // --- ROADS: realistic widths ---
-        // Widths in pixels that scale with zoom to approximate real meters.
-        // At zoom 16: 1px ≈ 2.4m. Road widths (total with sidewalks):
-        // motorway ~24m, trunk ~18m, primary ~14m, secondary ~10m, tertiary ~9m, minor ~8m, service ~6m
-        // Match roads that are NOT tunnels: either no brunnel property, or brunnel != tunnel
-        const roadFilter = ['all',
-          ['any', ['!has', 'brunnel'], ['!=', 'brunnel', 'tunnel']],
-          ['!=', 'class', 'rail'], ['!=', 'class', 'path']];
-
-        // Layer 1: Sidewalk + curb (outermost, light gray)
-        style.layers.push({
-          id: 'road-sidewalk',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: roadFilter,
-          layout: { 'line-cap': 'round', 'line-join': 'round' },
-          minzoom: 11,
-          paint: {
-            'line-color': darkMode ? '#3a3a3a' : '#b0b0a8',
-            'line-width': [
-              'interpolate', ['exponential', 2], ['zoom'],
-              11, 1,
-              13, ['match', ['get', 'class'], 'motorway', 6, 'trunk', 5, 'primary', 4, 'secondary', 3.5, 'tertiary', 3, 'minor', 3, 'service', 2.5, 2.5],
-              16, ['match', ['get', 'class'], 'motorway', 22, 'trunk', 18, 'primary', 14, 'secondary', 11, 'tertiary', 10, 'minor', 9, 'service', 7, 7],
-              20, ['match', ['get', 'class'], 'motorway', 180, 'trunk', 140, 'primary', 110, 'secondary', 85, 'tertiary', 76, 'minor', 72, 'service', 56, 56],
-            ],
-            'line-opacity': 0.9,
-          },
-        });
-
-        // Layer 2: Asphalt surface (dark, narrower than sidewalk)
-        style.layers.push({
-          id: 'road-asphalt',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: roadFilter,
-          layout: { 'line-cap': 'round', 'line-join': 'round' },
-          minzoom: 11,
-          paint: {
-            'line-color': darkMode ? '#252525' : '#505050',
-            'line-width': [
-              'interpolate', ['exponential', 2], ['zoom'],
-              11, 0.5,
-              13, ['match', ['get', 'class'], 'motorway', 5, 'trunk', 4, 'primary', 3, 'secondary', 2.5, 'tertiary', 2, 'minor', 2, 'service', 1.5, 1.5],
-              16, ['match', ['get', 'class'], 'motorway', 18, 'trunk', 14, 'primary', 11, 'secondary', 8, 'tertiary', 7, 'minor', 7, 'service', 5, 5],
-              20, ['match', ['get', 'class'], 'motorway', 150, 'trunk', 114, 'primary', 90, 'secondary', 66, 'tertiary', 58, 'minor', 54, 'service', 42, 42],
-            ],
-            'line-opacity': 0.95,
-          },
-        });
-
-        // Layer 3: Center line (yellow for arterials, white for local)
-        style.layers.push({
-          id: 'road-center-line',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['all', ['!=', 'brunnel', 'tunnel'], ['!=', 'class', 'rail'], ['!=', 'class', 'path'],
-                   ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary', 'tertiary']],
-          layout: { 'line-cap': 'butt' },
-          minzoom: 15,
-          paint: {
-            'line-color': ['match', ['get', 'class'], 'motorway', '#ffcc00', 'trunk', '#ffcc00', 'primary', '#ffcc00', '#ffffff'],
-            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 15, 0.3, 18, 1.2, 20, 5],
-            'line-dasharray': [6, 4],
-            'line-opacity': 0.8,
-          },
-        });
-
-        // Layer 4: Edge lines (white on both sides of major roads)
-        style.layers.push({
-          id: 'road-edge-lines',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['all', ['!=', 'brunnel', 'tunnel'],
-                   ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary']],
-          layout: { 'line-cap': 'butt' },
-          minzoom: 15,
-          paint: {
-            'line-color': '#ffffff',
-            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 15, 0.2, 18, 0.8, 20, 3],
-            'line-gap-width': [
-              'interpolate', ['exponential', 2], ['zoom'],
-              15, ['match', ['get', 'class'], 'motorway', 4, 'trunk', 3, 'primary', 2.5, 2],
-              18, ['match', ['get', 'class'], 'motorway', 22, 'trunk', 16, 'primary', 13, 9],
-              20, ['match', ['get', 'class'], 'motorway', 120, 'trunk', 88, 'primary', 72, 50],
-            ],
-            'line-opacity': 0.5,
-          },
-        });
-
-        // Paths / sidewalks standalone
-        style.layers.push({
-          id: 'road-paths',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['==', 'class', 'path'],
-          layout: { 'line-cap': 'round' },
-          minzoom: 14,
-          paint: {
-            'line-color': darkMode ? '#4a4a3a' : '#c8b898',
-            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 14, 0.5, 18, 4],
-            'line-opacity': 0.7,
-          },
-        });
-
-        // Rail
-        style.layers.push({
-          id: 'rail-3d',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['==', 'class', 'rail'],
-          layout: { 'line-cap': 'butt' },
-          paint: {
-            'line-color': darkMode ? '#666666' : '#777777',
-            'line-width': ['interpolate', ['exponential', 2], ['zoom'], 10, 0.5, 18, 5],
-            'line-dasharray': [4, 2],
-            'line-opacity': 0.8,
-          },
-        });
-
-        // --- BRIDGES: wider with guardrails ---
-        style.layers.push({
-          id: 'bridge-edge',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['==', 'brunnel', 'bridge'],
-          layout: { 'line-cap': 'butt', 'line-join': 'miter' },
-          paint: {
-            'line-color': darkMode ? '#555555' : '#888888',
-            'line-width': [
-              'interpolate', ['exponential', 2], ['zoom'],
-              11, ['match', ['get', 'class'], 'motorway', 3, 'trunk', 2.5, 'primary', 2, 1.5],
-              18, ['match', ['get', 'class'], 'motorway', 38, 'trunk', 30, 'primary', 24, 16],
-            ],
-            'line-opacity': 0.95,
-          },
-        });
-        style.layers.push({
-          id: 'bridge-surface',
-          type: 'line',
-          source: cartoSource,
-          'source-layer': 'transportation',
-          filter: ['==', 'brunnel', 'bridge'],
-          layout: { 'line-cap': 'butt', 'line-join': 'miter' },
-          paint: {
-            'line-color': darkMode ? '#333333' : '#a0a0a0',
-            'line-width': [
-              'interpolate', ['exponential', 2], ['zoom'],
-              11, ['match', ['get', 'class'], 'motorway', 2.5, 'trunk', 2, 'primary', 1.5, 1],
-              18, ['match', ['get', 'class'], 'motorway', 32, 'trunk', 24, 'primary', 20, 12],
-            ],
-            'line-opacity': 0.95,
-          },
-        });
-      }
-
-      // Hillshade under all layers
-      style.layers.unshift({
-        id: 'hillshade-layer',
-        type: 'hillshade',
-        source: 'hillshade-dem',
-        paint: {
-          'hillshade-shadow-color': darkMode ? '#000000' : '#473B24',
-          'hillshade-exaggeration': 0.5,
-        },
-      });
-
-      const map = new maplibregl.Map({
-        container: containerRef.current!,
-        style,
-        center: txPosition,
-        zoom: 11,
-        attributionControl: false,
-        maxPitch: 85,
-        ...(({ farZ: 100000 }) as any), // unlimited view distance
-      });
-
-      map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
-      map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
-      map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
-      map.addControl(new maplibregl.TerrainControl({ source: 'terrain-dem', exaggeration: 1.5 }));
-
-      map.on('click', (e) => {
-        const target = (e.originalEvent as MouseEvent)?.target as HTMLElement;
-        if (target && !target.closest('.maplibregl-canvas')) return;
-        onMapClickRef.current(e.lngLat.lat, e.lngLat.lng);
-      });
-
-      map.on('mousemove', (e) => {
-        if (coordsRef.current) {
-          coordsRef.current.textContent = `${e.lngLat.lat.toFixed(6)}, ${e.lngLat.lng.toFixed(6)}`;
-        }
-      });
-
-      // Center crosshair GPS coordinates
-      const updateCenter = () => {
-        const c = map.getCenter();
-        const el = document.getElementById('center-coords');
-        if (el) el.textContent = `${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}`;
-      };
-      map.on('move', updateCenter);
-      map.on('load', updateCenter);
-
-      const el = createTxMarkerElement();
-      const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'bottom' })
-        .setLngLat(txPosition)
-        .addTo(map);
-
-      marker.on('dragend', () => {
-        const pos = marker.getLngLat();
-        onMapClickRef.current(pos.lat, pos.lng);
-      });
-
-      markerRef.current = marker;
-      mapRef.current = map;
-      // Signal other effects once the map is fully loaded
-      map.once('idle', () => {
-        const t = performance.now() - loadStartRef.current;
-        setLoadMetrics(m => ({ ...m, map: Math.round(t) }));
-        console.log(`⏱ Map base loaded: ${Math.round(t)}ms`);
-        setMapReady(n => n + 1);
-      });
-
-      // Middle-mouse-button drag = rotate + pitch (3D navigation)
-      const canvas = map.getCanvas();
-      let midDrag = false;
-      let lastX = 0;
-      let lastY = 0;
-
-      const onMidDown = (e: MouseEvent) => {
-        if (e.button !== 1) return;
-        e.preventDefault();
-        midDrag = true;
-        lastX = e.clientX;
-        lastY = e.clientY;
-        canvas.style.cursor = 'grabbing';
-        map.dragPan.disable();
-      };
-      const onMidMove = (e: MouseEvent) => {
-        if (!midDrag) return;
-        e.preventDefault();
-        const dx = e.clientX - lastX;
-        const dy = e.clientY - lastY;
-        lastX = e.clientX;
-        lastY = e.clientY;
-        const bearing = map.getBearing() + dx * 0.5;
-        const pitch = Math.max(0, Math.min(85, map.getPitch() - dy * 0.5));
-        map.jumpTo({ bearing, pitch });
-      };
-      const onMidUp = (e: MouseEvent) => {
-        if (e.button !== 1 || !midDrag) return;
-        midDrag = false;
-        canvas.style.cursor = '';
-        map.dragPan.enable();
-      };
-      const onMidDownPrevent = (e: MouseEvent) => {
-        if (e.button === 1) e.preventDefault();
-      };
-
-      canvas.addEventListener('mousedown', onMidDown);
-      canvas.addEventListener('auxclick', onMidDownPrevent);
-      window.addEventListener('mousemove', onMidMove);
-      window.addEventListener('mouseup', onMidUp);
-
-      cleanupRef.current = () => {
-        canvas.removeEventListener('mousedown', onMidDown);
-        canvas.removeEventListener('auxclick', onMidDownPrevent);
-        window.removeEventListener('mousemove', onMidMove);
-        window.removeEventListener('mouseup', onMidUp);
-        marker.remove();
-        map.remove();
-        markerRef.current = null;
-        mapRef.current = null;
-      };
+    loadStartRef.current = performance.now();
+    const viewer = createCesiumViewer({
+      container: containerRef.current,
+      darkMode,
+      txPosition,
     });
+    viewerRef.current = viewer;
+
+    // Coordinate tracking on mouse move
+    const coordHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas as HTMLCanvasElement);
+    coordHandler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
+      const ray = viewer.camera.getPickRay(movement.endPosition);
+      if (!ray) return;
+      const cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+      if (!cartesian) return;
+      const carto = Cesium.Cartographic.fromCartesian(cartesian);
+      if (coordsRef.current) {
+        coordsRef.current.textContent =
+          `${Cesium.Math.toDegrees(carto.latitude).toFixed(6)}, ${Cesium.Math.toDegrees(carto.longitude).toFixed(6)}`;
+      }
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+    // Center coordinates update on camera move
+    const updateCenter = () => {
+      const ray = viewer.camera.getPickRay(new Cesium.Cartesian2(
+        viewer.canvas.clientWidth / 2,
+        viewer.canvas.clientHeight / 2,
+      ));
+      if (!ray) return;
+      const cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+      if (!cartesian) return;
+      const carto = Cesium.Cartographic.fromCartesian(cartesian);
+      const el = document.getElementById('center-coords');
+      if (el) {
+        el.textContent =
+          `${Cesium.Math.toDegrees(carto.latitude).toFixed(6)}, ${Cesium.Math.toDegrees(carto.longitude).toFixed(6)}`;
+      }
+    };
+    viewer.camera.moveEnd.addEventListener(updateCenter);
+
+    // TX marker
+    const marker = createTxMarker(
+      viewer,
+      txPosition,
+      (lat, lon) => onMapClickRef.current(lat, lon),
+      (lat, lon) => onMapClickRef.current(lat, lon),
+    );
+    markerRef.current = marker;
+
+    const tMap = performance.now() - loadStartRef.current;
+    setLoadMetrics(m => ({ ...m, map: Math.round(tMap) }));
+    console.log(`Cesium viewer ready: ${Math.round(tMap)}ms`);
+
+    setViewerReady(n => n + 1);
 
     return () => {
-      cancelled = true;
-      cleanupRef.current?.();
+      coordHandler.destroy();
+      viewer.camera.moveEnd.removeEventListener(updateCenter);
+      marker.destroy();
+      markerRef.current = null;
+      buildingPrimRef.current?.destroy(viewer);
+      buildingPrimRef.current = null;
+      treePrimRef.current?.destroy(viewer);
+      treePrimRef.current = null;
+      destroyCesiumViewer(viewer);
+      viewerRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [darkMode]);
+  }, []); // Only init once — dark mode handled separately
 
-  // Update marker
+  // Dark mode: swap base imagery
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || viewerReady === 0) return;
+    swapBaseImagery(viewer, darkMode);
+  }, [darkMode, viewerReady]);
+
+  // Update marker position
   useEffect(() => {
     if (markerRef.current) {
-      const current = markerRef.current.getLngLat();
-      if (Math.abs(current.lng - txPosition[0]) > 0.000001 ||
-          Math.abs(current.lat - txPosition[1]) > 0.000001) {
-        markerRef.current.setLngLat(txPosition);
-      }
+      updateTxMarkerPosition(markerRef.current.entity, txPosition);
+      viewerRef.current?.scene.requestRender();
     }
-  }, [txPosition[0], txPosition[1], mapReady]);
+  }, [txPosition[0], txPosition[1], viewerReady]);
 
   // Coverage overlay
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !coverageResult) return;
+    const viewer = viewerRef.current;
+    if (!viewer || !coverageResult) return;
 
-    const add = () => {
-      if (map.getLayer('coverage-layer')) map.removeLayer('coverage-layer');
-      if (map.getSource('coverage-source')) map.removeSource('coverage-source');
+    addCoverageLayer(viewer, coverageResult);
+    viewer.scene.requestRender();
 
-      const { north, south, east, west } = coverageResult.bounds;
-      // Use raster tiles instead of image source to avoid 3D terrain clipping
-      // Calculate optimal maxzoom from coverage resolution
-      // At maxzoom, MapLibre will oversample for higher zooms (consistent quality)
-      const covWidthDeg = east - west;
-      const covPixels = coverageResult.stats?.grid_size || 666;
-      const pixelDeg = covWidthDeg / covPixels;
-      // Each zoom level tile covers 360/2^z degrees. We want ~1 source pixel per tile pixel.
-      // tile_deg = 360 / 2^z, pixels_per_tile = tile_deg / pixelDeg
-      // We want pixels_per_tile >= 512, so z <= log2(360 / (pixelDeg * 512))
-      const optimalMaxZoom = Math.min(15, Math.max(10, Math.floor(Math.log2(360 / (pixelDeg * 512)))));
-
-      // Cache-buster: unique timestamp per coverage result forces tile reload
-      const cacheBuster = Date.now();
-      map.addSource('coverage-source', {
-        type: 'raster',
-        tiles: [window.location.origin + `/api/coverage/tiles/{z}/{x}/{y}.png?t=${cacheBuster}`],
-        tileSize: 512,
-        bounds: [west, south, east, north],
-        minzoom: 8,
-        maxzoom: optimalMaxZoom,
-      });
-      map.addLayer({
-        id: 'coverage-layer',
-        type: 'raster',
-        source: 'coverage-source',
-        paint: { 'raster-opacity': 0.55, 'raster-fade-duration': 0 },
-      });
+    return () => {
+      if (viewerRef.current) removeCoverageLayer(viewerRef.current);
     };
+  }, [coverageResult, viewerReady]);
 
-    add();
-  }, [coverageResult, mapReady]);
-
-  // Terrain/canopy layer overlay
+  // Terrain overlay layer
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const removeTerrain = () => {
-      if (map.getLayer('terrain-layer')) map.removeLayer('terrain-layer');
-      if (map.getSource('terrain-source')) map.removeSource('terrain-source');
-    };
+    const viewer = viewerRef.current;
+    if (!viewer) return;
 
     if (!terrainLayer) {
-      if (map.isStyleLoaded()) removeTerrain();
+      removeTerrainOverlay(viewer);
+      viewer.scene.requestRender();
       return;
     }
 
     setLoadingTerrain(true);
-    const lat = txPosition[1];
-    const lon = txPosition[0];
-    // Use finer resolution for smaller areas, cap at 500x500 grid max
-    const res = Math.max(2, (2 * radius * 1000) / 500);
-
-    fetch(`/api/terrain/render?lat=${lat}&lon=${lon}&radius_km=${radius}&resolution_m=${res}&mode=${terrainLayer}`)
-      .then(r => r.json())
-      .then(data => {
-        if (!data.image_url || !map) return;
-
-        const add = () => {
-          removeTerrain();
-          const { north, south, east, west } = data.bounds;
-          map.addSource('terrain-source', {
-            type: 'image',
-            url: data.image_url,
-            coordinates: [[west, north], [east, north], [east, south], [west, south]],
-          });
-          map.addLayer({
-            id: 'terrain-layer',
-            type: 'raster',
-            source: 'terrain-source',
-            paint: { 'raster-opacity': 0.6 },
-          }, map.getLayer('coverage-layer') ? 'coverage-layer' : undefined);
-        };
-
-        add();
-      })
+    addTerrainOverlay(viewer, terrainLayer, txPosition, radius)
+      .then(() => viewer.scene.requestRender())
       .catch(console.error)
       .finally(() => setLoadingTerrain(false));
-  }, [terrainLayer, txPosition[0], txPosition[1], radius, mapReady]);
+  }, [terrainLayer, txPosition[0], txPosition[1], radius, viewerReady]);
 
-  // 3D toggle: camera tilt
+  // 3D toggle: camera pitch
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
 
     if (view3D) {
-      map.easeTo({ pitch: 60, bearing: -20, duration: 800 });
+      viewer.camera.flyTo({
+        destination: viewer.camera.positionWC,
+        orientation: {
+          heading: Cesium.Math.toRadians(-20),
+          pitch: Cesium.Math.toRadians(-30),
+          roll: 0,
+        },
+        duration: 0.8,
+      });
     } else {
-      map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
+      viewer.camera.flyTo({
+        destination: viewer.camera.positionWC,
+        orientation: {
+          heading: 0,
+          pitch: Cesium.Math.toRadians(-90),
+          roll: 0,
+        },
+        duration: 0.5,
+      });
     }
-  }, [view3D, mapReady]);
+  }, [view3D, viewerReady]);
 
-  // Load entire 3D scene in one binary request (buildings + trees)
-  const lastSceneLoad = useRef<{ lat: number; lon: number; radius: number } | null>(null);
+  // Load 3D scene (buildings + trees) from binary endpoint
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
+    const viewer = viewerRef.current;
+    if (!viewer || viewerReady === 0) return;
 
     const lat = txPosition[1], lon = txPosition[0];
     const sceneRadius = Math.min(Math.max(radius, 2), 100);
 
-    const prev = lastSceneLoad.current;
-    if (prev) {
-      const dlat = (lat - prev.lat) * 111320;
-      const dlon = (lon - prev.lon) * 111320 * Math.cos(lat * Math.PI / 180);
-      if (Math.sqrt(dlat * dlat + dlon * dlon) < 500 && Math.abs(sceneRadius - prev.radius) < 0.5) return;
-    }
+    if (!shouldReloadScene(lastSceneLoad.current, lat, lon, sceneRadius)) return;
 
     let cancelled = false;
+
     const loadScene = async () => {
       try {
         const resp = await fetch(`/api/data/scene?lat=${lat}&lon=${lon}&radius_km=${sceneRadius}`);
@@ -698,226 +288,83 @@ export const MapView = React.memo(function MapView({
         if (cancelled) return;
 
         const tFetch = performance.now() - loadStartRef.current;
-        const view = new DataView(buf);
-        let off = 4;
-        const nBldg = view.getUint32(off, true); off += 4;
-        const nTrees = view.getUint32(off, true); off += 4;
-        const serverMs = view.getFloat32(off, true); off += 4;
         setLoadMetrics(m => ({ ...m, fetch: Math.round(tFetch) }));
-        console.log(`⏱ Scene fetched: ${nBldg} bldg + ${nTrees} trees (${Math.round(tFetch)}ms, ${(buf.byteLength/1e6).toFixed(1)}MB, server ${Math.round(serverMs)}ms)`);
 
-        // --- Buildings + shadows from binary ---
-        // Sun direction: summer afternoon Quebec, azimuth ~210° (SSW), elevation ~45°
-        const sunAz = 210 * Math.PI / 180;
-        const sunEl = 45 * Math.PI / 180;
-        const shadowDx = Math.sin(sunAz) / Math.tan(sunEl); // lon offset per meter of height
-        const shadowDy = -Math.cos(sunAz) / Math.tan(sunEl); // lat offset
-        const mToLon = 1 / (111320 * Math.cos(lat * Math.PI / 180));
-        const mToLat = 1 / 111320;
+        const scene: ParsedScene = parseScene(buf);
+        console.log(`Scene fetched: ${scene.buildings.length} bldg + ${scene.trees.length} trees (${Math.round(tFetch)}ms, ${(scene.byteLength / 1e6).toFixed(1)}MB, server ${Math.round(scene.serverMs)}ms)`);
 
-        const bldgFeatures = new Array(nBldg);
-        const shadowFeatures: any[] = [];
+        if (cancelled) return;
 
-        for (let i = 0; i < nBldg; i++) {
-          const nVerts = view.getUint16(off, true); off += 2;
-          const h = view.getFloat32(off, true); off += 4;
-          const ring = new Array(nVerts);
-          let cLat = 0, cLon = 0;
-          for (let v = 0; v < nVerts; v++) {
-            const lng = view.getFloat32(off, true); off += 4;
-            const lt = view.getFloat32(off, true); off += 4;
-            ring[v] = [lng, lt]; cLon += lng; cLat += lt;
-          }
-          cLon /= nVerts; cLat /= nVerts;
-          bldgFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
-            properties: { height: h, centroid_lat: cLat, centroid_lon: cLon } };
-
-          // Shadow polygon: offset each vertex by sun projection
-          if (h > 3) {
-            const dLon = h * shadowDx * mToLon;
-            const dLat = h * shadowDy * mToLat;
-            // Shadow = union of base + offset base (simplified as offset polygon)
-            const shadowRing = new Array(nVerts);
-            for (let v = 0; v < nVerts; v++) {
-              shadowRing[v] = [ring[v][0] + dLon, ring[v][1] + dLat];
-            }
-            shadowFeatures.push({
-              type: 'Feature',
-              geometry: { type: 'Polygon', coordinates: [shadowRing] },
-              properties: {},
-            });
-          }
+        // --- Buildings ---
+        if (scene.buildings.length > 0) {
+          buildingPrimRef.current?.destroy(viewer);
+          const tBldg = performance.now();
+          buildingPrimRef.current = createBuildingPrimitives(scene.buildings, viewer);
+          parsedBuildingsRef.current = scene.buildings;
+          const dtBldg = performance.now() - tBldg;
+          setLoadMetrics(m => ({ ...m, buildings: Math.round(performance.now() - loadStartRef.current) }));
+          console.log(`Buildings rendered: ${scene.buildings.length} (${Math.round(dtBldg)}ms)`);
         }
 
-        if (bldgFeatures.length > 0 && !cancelled) {
-          try {
-            if (map.getLayer('buildings-3d')) map.removeLayer('buildings-3d');
-            if (map.getLayer('shadows')) map.removeLayer('shadows');
-            if (map.getSource('buildings-3d-source')) map.removeSource('buildings-3d-source');
-            if (map.getSource('shadows-source')) map.removeSource('shadows-source');
-          } catch (_) {}
+        if (cancelled) return;
 
-          // Ground shadows layer (rendered first, below buildings)
-          if (shadowFeatures.length > 0) {
-            map.addSource('shadows-source', { type: 'geojson', data: { type: 'FeatureCollection', features: shadowFeatures } });
-            map.addLayer({ id: 'shadows', type: 'fill', source: 'shadows-source',
-              paint: { 'fill-color': '#000000', 'fill-opacity': 0.2 } });
-          }
-
-          // Buildings with ambient occlusion
-          map.addSource('buildings-3d-source', { type: 'geojson', data: { type: 'FeatureCollection', features: bldgFeatures } });
-          map.addLayer({ id: 'buildings-3d', type: 'fill-extrusion', source: 'buildings-3d-source',
-            paint: {
-              'fill-extrusion-color': ['case', ['==', ['typeof', ['get', 'signal']] as any, 'number'],
-                ['interpolate', ['linear'], ['get', 'signal'], -120, '#461eaa', -100, '#0082d2', -90, '#00b478', -80, '#64e114', -70, '#dcf000', -60, '#ffbe00', -50, '#ff6e00', -30, '#ff1e1e'],
-                '#b0b0b0'],
-              'fill-extrusion-height': ['*', ['get', 'height'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.8,
-            } as any });
-          setBuildingsLoaded(true);
-          console.log(`⏱ Buildings + shadows rendered: ${bldgFeatures.length} bldg, ${shadowFeatures.length} shadows (${Math.round(performance.now() - loadStartRef.current)}ms)`);
-        }
-
-        // --- Trees via deck.gl (GPU instanced, handles millions) ---
-        if (nTrees > 0 && !cancelled) {
-          // Parse tree data from binary into flat arrays
-          const treeData = new Array(nTrees);
-          for (let i = 0; i < nTrees; i++) {
-            const tlng = view.getFloat32(off, true); off += 4;
-            const tlat = view.getFloat32(off, true); off += 4;
-            const h = view.getFloat32(off, true); off += 4;
-            treeData[i] = { p: [tlng, tlat], h };
-          }
-
-          // Remove previous tree layers
-          for (let ci = 0; ci < 20; ci++) {
-            try { if (map.getLayer(`trees-c-${ci}`)) map.removeLayer(`trees-c-${ci}`); } catch (_) {}
-            try { if (map.getLayer(`trees-t-${ci}`)) map.removeLayer(`trees-t-${ci}`); } catch (_) {}
-            try { if (map.getSource(`trees-c-${ci}`)) map.removeSource(`trees-c-${ci}`); } catch (_) {}
-            try { if (map.getSource(`trees-t-${ci}`)) map.removeSource(`trees-t-${ci}`); } catch (_) {}
-          }
-
-          // Build hexagons and split into chunks of 150k to avoid MapLibre stringify crash
-          const cosLat = Math.cos((lat * Math.PI) / 180);
-          const hc = [1, 0.5, -0.5, -1, -0.5, 0.5, 1], hs = [0, 0.866, 0.866, 0, -0.866, -0.866, 0];
-          const CHUNK = 150000;
-          const nChunks = Math.ceil(nTrees / CHUNK);
-          const greens = [[124, 179, 66], [67, 160, 71], [46, 125, 50], [27, 94, 32], [51, 105, 30], [76, 175, 80]];
-
-          for (let ci = 0; ci < nChunks; ci++) {
-            const start = ci * CHUNK;
-            const end = Math.min(start + CHUNK, nTrees);
-            const canopy: any[] = [];
-            const trunk: any[] = [];
-
-            for (let i = start; i < end; i++) {
-              const td = treeData[i];
-              const h = td.h;
-              const cr = Math.max(2, h * 0.35), cdlat = cr / 111320, cdlng = cr / (111320 * cosLat);
-              const cring = new Array(7);
-              for (let j = 0; j < 7; j++) cring[j] = [td.p[0] + cdlng * hc[j], td.p[1] + cdlat * hs[j]];
-              canopy.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [cring] }, properties: { h, b: h * 0.3 } });
-
-              const tr = Math.max(0.3, h * 0.05), tdlat = tr / 111320, tdlng = tr / (111320 * cosLat);
-              const tring = new Array(7);
-              for (let j = 0; j < 7; j++) tring[j] = [td.p[0] + tdlng * hc[j], td.p[1] + tdlat * hs[j]];
-              trunk.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [tring] }, properties: { h: h * 0.3 } });
-            }
-
-            const gc = greens[ci % greens.length];
-            const color = `rgb(${gc[0]},${gc[1]},${gc[2]})`;
-
-            map.addSource(`trees-t-${ci}`, { type: 'geojson', data: { type: 'FeatureCollection', features: trunk } });
-            map.addLayer({ id: `trees-t-${ci}`, type: 'fill-extrusion', source: `trees-t-${ci}`,
-              paint: { 'fill-extrusion-color': '#5D4037', 'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.9 } });
-
-            map.addSource(`trees-c-${ci}`, { type: 'geojson', data: { type: 'FeatureCollection', features: canopy } });
-            map.addLayer({ id: `trees-c-${ci}`, type: 'fill-extrusion', source: `trees-c-${ci}`,
-              paint: { 'fill-extrusion-color': color, 'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
-                'fill-extrusion-base': ['*', ['get', 'b'], 1.5], 'fill-extrusion-opacity': 0.8 } });
-
-            console.log(`⏱ Tree chunk ${ci+1}/${nChunks}: ${end-start} trees (${Math.round(performance.now() - loadStartRef.current)}ms)`);
-          }
-
-          console.log(`⏱ All trees rendered: ${nTrees} in ${nChunks} chunks (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+        // --- Trees ---
+        if (scene.trees.length > 0) {
+          treePrimRef.current?.destroy(viewer);
+          const tTrees = performance.now();
+          treePrimRef.current = createTreePrimitives(scene.trees, viewer);
+          const dtTrees = performance.now() - tTrees;
+          setLoadMetrics(m => ({ ...m, trees: Math.round(performance.now() - loadStartRef.current) }));
+          console.log(`Trees rendered: ${scene.trees.length} (${Math.round(dtTrees)}ms)`);
         }
 
         lastSceneLoad.current = { lat, lon, radius: sceneRadius };
+        viewer.scene.requestRender();
         setSceneReady(true);
+
         const totalT = performance.now() - loadStartRef.current;
         setLoadMetrics(m => ({ ...m, total: Math.round(totalT) }));
-        console.log(`⏱ Scene complete: ${Math.round(totalT)}ms`);
-      } catch (e) { console.error('Scene load failed:', e); setSceneReady(true); }
+        console.log(`Scene complete: ${Math.round(totalT)}ms`);
+      } catch (e) {
+        console.error('Scene load failed:', e);
+        setSceneReady(true);
+      }
     };
 
     loadScene();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [txPosition[0], txPosition[1], radius, mapReady]);
+  }, [txPosition[0], txPosition[1], radius, viewerReady]);
 
-  // Color buildings based on coverage signal values (dBm)
+  // Recolor buildings after coverage calculation
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !coverageResult) return;
-    const src = map.getSource('buildings-3d-source') as any;
-    if (!src?._data?.features) return;
+    const viewer = viewerRef.current;
+    if (!viewer || !coverageResult || parsedBuildingsRef.current.length === 0) return;
 
     let cancelled = false;
-    const features = src._data.features;
+    const doRecolor = async () => {
+      const signalValues = await sampleBuildingSignals(parsedBuildingsRef.current);
+      if (cancelled || signalValues.size === 0) return;
 
-    const updateColors = async () => {
-      const points: number[][] = [];
-      const indices: number[] = [];
-      for (let i = 0; i < features.length; i++) {
-        const clat = features[i].properties?.centroid_lat;
-        const clon = features[i].properties?.centroid_lon;
-        if (clat && clon) { points.push([clat, clon]); indices.push(i); }
-      }
-      if (points.length === 0 || cancelled) return;
-
-      const chunkSize = 50000;
-      for (let start = 0; start < points.length; start += chunkSize) {
-        if (cancelled) return;
-        try {
-          const resp = await fetch('/api/coverage/sample', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ points: points.slice(start, start + chunkSize) }),
-          });
-          if (!resp.ok || cancelled) continue;
-          const { values } = await resp.json();
-          for (let j = 0; j < values.length; j++) features[indices[start + j]].properties.signal = values[j];
-        } catch (e) { console.warn('Coverage sample failed:', e); }
-      }
-      if (!cancelled) { src.setData({ type: 'FeatureCollection', features }); console.log('Buildings colored'); }
+      buildingPrimRef.current = recolorBuildings(
+        parsedBuildingsRef.current,
+        viewer,
+        signalValues,
+        buildingPrimRef.current!,
+      );
+      viewer.scene.requestRender();
+      console.log(`Buildings colored: ${signalValues.size} sampled`);
     };
 
-    updateColors();
+    doRecolor();
     return () => { cancelled = true; };
   }, [coverageResult]);
 
-  // Toggle trees visibility (Three.js custom layer)
+  // Toggle tree visibility
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    try {
-      const vis = showVegetation ? 'visible' : 'none';
-      for (let ci = 0; ci < 20; ci++) {
-        try { if (map.getLayer(`trees-c-${ci}`)) map.setLayoutProperty(`trees-c-${ci}`, 'visibility', vis); } catch (_) {}
-        try { if (map.getLayer(`trees-t-${ci}`)) map.setLayoutProperty(`trees-t-${ci}`, 'visibility', vis); } catch (_) {}
-      }
-    } catch (_) {}
-  }, [showVegetation, mapReady]);
-
-  // Toggle roads visibility
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    try {
-      if (map.getLayer('roads-3d')) {
-        map.setLayoutProperty('roads-3d', 'visibility', showRoads ? 'visible' : 'none');
-      }
-    } catch (_) { /* layer may not exist yet */ }
-  }, [showRoads, mapReady]);
-
+    treePrimRef.current?.setVisible(showVegetation);
+    viewerRef.current?.scene.requestRender();
+  }, [showVegetation, viewerReady]);
 
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
   const fr = locale === 'fr';
@@ -929,7 +376,6 @@ export const MapView = React.memo(function MapView({
       {/* Center crosshair + GPS coordinates */}
       <div className="absolute inset-0 pointer-events-none z-20 flex items-center justify-center">
         <div className="relative">
-          {/* Crosshair lines */}
           <div className="absolute w-8 h-[2px] bg-white/80 -left-4 top-1/2 -translate-y-1/2 shadow-sm" style={{ boxShadow: '0 0 3px rgba(0,0,0,0.8)' }} />
           <div className="absolute h-8 w-[2px] bg-white/80 left-1/2 -top-4 -translate-x-1/2 shadow-sm" style={{ boxShadow: '0 0 3px rgba(0,0,0,0.8)' }} />
           <div className="absolute w-1.5 h-1.5 rounded-full bg-red-500 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
@@ -948,22 +394,22 @@ export const MapView = React.memo(function MapView({
         </div>
       </div>
 
-      {/* Loading overlay — hides map until all layers are loaded */}
+      {/* Loading overlay */}
       {!sceneReady && (
         <div className="absolute inset-0 z-50 bg-surface-1 flex flex-col items-center justify-center gap-4">
           <div className="w-10 h-10 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
           <div className="text-sm text-gray-400 space-y-1 text-center">
-            <div>{fr ? 'Chargement du modèle 3D...' : 'Loading 3D model...'}</div>
+            <div>{fr ? 'Chargement du modele 3D...' : 'Loading 3D model...'}</div>
             <div className="text-xs text-gray-500 font-mono space-y-0.5">
               {loadMetrics.map ? <div>Carte: {loadMetrics.map}ms</div> : <div>Carte...</div>}
-              {loadMetrics.buildings ? <div>Bâtiments: {loadMetrics.buildings}ms</div> : mapReady > 0 ? <div>Bâtiments...</div> : null}
+              {loadMetrics.buildings ? <div>Batiments: {loadMetrics.buildings}ms</div> : viewerReady > 0 ? <div>Batiments...</div> : null}
               {loadMetrics.trees ? <div>Arbres: {loadMetrics.trees}ms</div> : loadMetrics.buildings ? <div>Arbres...</div> : null}
             </div>
           </div>
         </div>
       )}
 
-      {/* Layer control buttons — stopPropagation prevents clicks reaching the map */}
+      {/* Layer control buttons */}
       <div
         className="absolute top-4 left-2 z-10 flex flex-col gap-1"
         onMouseDown={(e) => e.stopPropagation()}
@@ -974,7 +420,7 @@ export const MapView = React.memo(function MapView({
           className={`p-2 rounded-lg shadow-lg border transition-colors ${
             layerMenuOpen ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface-2/90 border-gray-700/50 text-gray-300 hover:bg-surface-3'
           }`}
-          title={fr ? 'Couches de données' : 'Data layers'}
+          title={fr ? 'Couches de donnees' : 'Data layers'}
         >
           <Layers className="w-4 h-4" />
         </button>
@@ -983,7 +429,7 @@ export const MapView = React.memo(function MapView({
           className={`p-2 rounded-lg shadow-lg border transition-colors ${
             view3D ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface-2/90 border-gray-700/50 text-gray-300 hover:bg-surface-3'
           }`}
-          title={fr ? 'Vue 3D (bâtiments + signal)' : '3D view (buildings + signal)'}
+          title={fr ? 'Vue 3D (batiments + signal)' : '3D view (buildings + signal)'}
         >
           <Box className="w-4 h-4" />
         </button>
@@ -996,7 +442,7 @@ export const MapView = React.memo(function MapView({
 
             <LayerButton
               icon={<Mountain className="w-3.5 h-3.5" />}
-              label={fr ? 'Élévation (MNT)' : 'Elevation (DTM)'}
+              label={fr ? 'Elevation (MNT)' : 'Elevation (DTM)'}
               active={terrainLayer === 'elevation'}
               onClick={() => onTerrainLayerChange(terrainLayer === 'elevation' ? null : 'elevation')}
               loading={loadingTerrain && terrainLayer === 'elevation'}
@@ -1005,7 +451,7 @@ export const MapView = React.memo(function MapView({
               <>
                 <LayerButton
                   icon={<TreePine className="w-3.5 h-3.5" />}
-                  label={fr ? 'Canopée / Bâtiments' : 'Canopy / Buildings'}
+                  label={fr ? 'Canopee / Batiments' : 'Canopy / Buildings'}
                   active={terrainLayer === 'canopy'}
                   onClick={() => onTerrainLayerChange(terrainLayer === 'canopy' ? null : 'canopy')}
                   loading={loadingTerrain && terrainLayer === 'canopy'}
