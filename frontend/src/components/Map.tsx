@@ -471,6 +471,15 @@ export const MapView = React.memo(function MapView({
         }
       });
 
+      // Center crosshair GPS coordinates
+      const updateCenter = () => {
+        const c = map.getCenter();
+        const el = document.getElementById('center-coords');
+        if (el) el.textContent = `${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}`;
+      };
+      map.on('move', updateCenter);
+      map.on('load', updateCenter);
+
       const el = createTxMarkerElement();
       const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'bottom' })
         .setLngLat(txPosition)
@@ -768,38 +777,68 @@ export const MapView = React.memo(function MapView({
           console.log(`⏱ Buildings + shadows rendered: ${bldgFeatures.length} bldg, ${shadowFeatures.length} shadows (${Math.round(performance.now() - loadStartRef.current)}ms)`);
         }
 
-        // --- Trees: trunk + canopy ---
+        // --- Trees via deck.gl (GPU instanced, handles millions) ---
         if (nTrees > 0 && !cancelled) {
-          try { if (map.getLayer('trees-canopy')) map.removeLayer('trees-canopy'); if (map.getLayer('trees-trunk')) map.removeLayer('trees-trunk');
-                if (map.getSource('trees-canopy-src')) map.removeSource('trees-canopy-src'); if (map.getSource('trees-trunk-src')) map.removeSource('trees-trunk-src'); } catch (_) {}
-
-          const cosLat = Math.cos((lat * Math.PI) / 180);
-          const hc = [1, 0.5, -0.5, -1, -0.5, 0.5, 1], hs = [0, 0.866, 0.866, 0, -0.866, -0.866, 0];
-          const canopyFeatures = new Array(nTrees), trunkFeatures = new Array(nTrees);
-
+          // Parse tree data from binary into flat arrays
+          const treeData = new Array(nTrees);
           for (let i = 0; i < nTrees; i++) {
             const tlng = view.getFloat32(off, true); off += 4;
             const tlat = view.getFloat32(off, true); off += 4;
             const h = view.getFloat32(off, true); off += 4;
-            const cr = Math.max(3, h * 0.4), cdlat = cr / 111320, cdlng = cr / (111320 * cosLat);
-            const cring = new Array(7);
-            for (let j = 0; j < 7; j++) cring[j] = [tlng + cdlng * hc[j], tlat + cdlat * hs[j]];
-            canopyFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [cring] }, properties: { h, base: h * 0.3 } };
-            const tr = Math.max(0.5, h * 0.06), tdlat = tr / 111320, tdlng = tr / (111320 * cosLat);
-            const tring = new Array(7);
-            for (let j = 0; j < 7; j++) tring[j] = [tlng + tdlng * hc[j], tlat + tdlat * hs[j]];
-            trunkFeatures[i] = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [tring] }, properties: { h: h * 0.3 } };
+            treeData[i] = { p: [tlng, tlat], h };
           }
 
-          map.addSource('trees-trunk-src', { type: 'geojson', data: { type: 'FeatureCollection', features: trunkFeatures } });
-          map.addLayer({ id: 'trees-trunk', type: 'fill-extrusion', source: 'trees-trunk-src',
-            paint: { 'fill-extrusion-color': '#5D4037', 'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.9 } });
-          map.addSource('trees-canopy-src', { type: 'geojson', data: { type: 'FeatureCollection', features: canopyFeatures } });
-          map.addLayer({ id: 'trees-canopy', type: 'fill-extrusion', source: 'trees-canopy-src',
-            paint: { 'fill-extrusion-color': ['interpolate', ['linear'], ['get', 'h'], 3, '#7cb342', 10, '#43a047', 20, '#2e7d32'],
-              'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': ['*', ['get', 'base'], 1.5], 'fill-extrusion-opacity': 0.8 } });
+          // Remove previous tree layers
+          for (let ci = 0; ci < 20; ci++) {
+            try { if (map.getLayer(`trees-c-${ci}`)) map.removeLayer(`trees-c-${ci}`); } catch (_) {}
+            try { if (map.getLayer(`trees-t-${ci}`)) map.removeLayer(`trees-t-${ci}`); } catch (_) {}
+            try { if (map.getSource(`trees-c-${ci}`)) map.removeSource(`trees-c-${ci}`); } catch (_) {}
+            try { if (map.getSource(`trees-t-${ci}`)) map.removeSource(`trees-t-${ci}`); } catch (_) {}
+          }
 
-          console.log(`⏱ Trees rendered: ${nTrees} canopy + trunk (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+          // Build hexagons and split into chunks of 150k to avoid MapLibre stringify crash
+          const cosLat = Math.cos((lat * Math.PI) / 180);
+          const hc = [1, 0.5, -0.5, -1, -0.5, 0.5, 1], hs = [0, 0.866, 0.866, 0, -0.866, -0.866, 0];
+          const CHUNK = 150000;
+          const nChunks = Math.ceil(nTrees / CHUNK);
+          const greens = [[124, 179, 66], [67, 160, 71], [46, 125, 50], [27, 94, 32], [51, 105, 30], [76, 175, 80]];
+
+          for (let ci = 0; ci < nChunks; ci++) {
+            const start = ci * CHUNK;
+            const end = Math.min(start + CHUNK, nTrees);
+            const canopy: any[] = [];
+            const trunk: any[] = [];
+
+            for (let i = start; i < end; i++) {
+              const td = treeData[i];
+              const h = td.h;
+              const cr = Math.max(2, h * 0.35), cdlat = cr / 111320, cdlng = cr / (111320 * cosLat);
+              const cring = new Array(7);
+              for (let j = 0; j < 7; j++) cring[j] = [td.p[0] + cdlng * hc[j], td.p[1] + cdlat * hs[j]];
+              canopy.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [cring] }, properties: { h, b: h * 0.3 } });
+
+              const tr = Math.max(0.3, h * 0.05), tdlat = tr / 111320, tdlng = tr / (111320 * cosLat);
+              const tring = new Array(7);
+              for (let j = 0; j < 7; j++) tring[j] = [td.p[0] + tdlng * hc[j], td.p[1] + tdlat * hs[j]];
+              trunk.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [tring] }, properties: { h: h * 0.3 } });
+            }
+
+            const gc = greens[ci % greens.length];
+            const color = `rgb(${gc[0]},${gc[1]},${gc[2]})`;
+
+            map.addSource(`trees-t-${ci}`, { type: 'geojson', data: { type: 'FeatureCollection', features: trunk } });
+            map.addLayer({ id: `trees-t-${ci}`, type: 'fill-extrusion', source: `trees-t-${ci}`,
+              paint: { 'fill-extrusion-color': '#5D4037', 'fill-extrusion-height': ['*', ['get', 'h'], 1.5], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 0.9 } });
+
+            map.addSource(`trees-c-${ci}`, { type: 'geojson', data: { type: 'FeatureCollection', features: canopy } });
+            map.addLayer({ id: `trees-c-${ci}`, type: 'fill-extrusion', source: `trees-c-${ci}`,
+              paint: { 'fill-extrusion-color': color, 'fill-extrusion-height': ['*', ['get', 'h'], 1.5],
+                'fill-extrusion-base': ['*', ['get', 'b'], 1.5], 'fill-extrusion-opacity': 0.8 } });
+
+            console.log(`⏱ Tree chunk ${ci+1}/${nChunks}: ${end-start} trees (${Math.round(performance.now() - loadStartRef.current)}ms)`);
+          }
+
+          console.log(`⏱ All trees rendered: ${nTrees} in ${nChunks} chunks (${Math.round(performance.now() - loadStartRef.current)}ms)`);
         }
 
         lastSceneLoad.current = { lat, lon, radius: sceneRadius };
@@ -861,8 +900,10 @@ export const MapView = React.memo(function MapView({
     if (!map) return;
     try {
       const vis = showVegetation ? 'visible' : 'none';
-      if (map.getLayer('trees-canopy')) map.setLayoutProperty('trees-canopy', 'visibility', vis);
-      if (map.getLayer('trees-trunk')) map.setLayoutProperty('trees-trunk', 'visibility', vis);
+      for (let ci = 0; ci < 20; ci++) {
+        try { if (map.getLayer(`trees-c-${ci}`)) map.setLayoutProperty(`trees-c-${ci}`, 'visibility', vis); } catch (_) {}
+        try { if (map.getLayer(`trees-t-${ci}`)) map.setLayoutProperty(`trees-t-${ci}`, 'visibility', vis); } catch (_) {}
+      }
     } catch (_) {}
   }, [showVegetation, mapReady]);
 
@@ -884,6 +925,28 @@ export const MapView = React.memo(function MapView({
   return (
     <div className="flex-1 relative overflow-hidden">
       <div ref={containerRef} style={{ position: 'absolute', inset: 0, backgroundColor: '#87CEEB' }} />
+
+      {/* Center crosshair + GPS coordinates */}
+      <div className="absolute inset-0 pointer-events-none z-20 flex items-center justify-center">
+        <div className="relative">
+          {/* Crosshair lines */}
+          <div className="absolute w-8 h-[2px] bg-white/80 -left-4 top-1/2 -translate-y-1/2 shadow-sm" style={{ boxShadow: '0 0 3px rgba(0,0,0,0.8)' }} />
+          <div className="absolute h-8 w-[2px] bg-white/80 left-1/2 -top-4 -translate-x-1/2 shadow-sm" style={{ boxShadow: '0 0 3px rgba(0,0,0,0.8)' }} />
+          <div className="absolute w-1.5 h-1.5 rounded-full bg-red-500 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
+        </div>
+      </div>
+      <div className="absolute left-1/2 -translate-x-1/2 bottom-16 z-20">
+        <div
+          className="bg-black/70 backdrop-blur-sm px-3 py-1 rounded text-xs font-mono text-white cursor-pointer hover:bg-black/90 active:bg-brand-600 transition-colors select-all"
+          title={fr ? 'Cliquer pour copier' : 'Click to copy'}
+          onClick={() => {
+            const el = document.getElementById('center-coords');
+            if (el) { navigator.clipboard.writeText(el.textContent || ''); }
+          }}
+        >
+          <span id="center-coords">...</span>
+        </div>
+      </div>
 
       {/* Loading overlay — hides map until all layers are loaded */}
       {!sceneReady && (

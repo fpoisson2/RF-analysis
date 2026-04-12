@@ -1125,12 +1125,14 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         return r, c
 
     def _sample_mhc_polygon(ring):
-        """Sample canopy height across a building polygon footprint.
-        Uses 90th percentile instead of max to avoid picking up
-        adjacent tall structures that bleed into the bounding box."""
+        """Sample building height from MHC, filtering out trees.
+        Strategy: estimate footprint area, then pick percentile accordingly.
+        - Large buildings (>200m²): 90th percentile (real height)
+        - Medium buildings (50-200m²): 50th percentile (median, avoids tree peaks)
+        - Small buildings (<50m²): 25th percentile (garage/shed, ignore trees above)
+        """
         if mhc_grid is None:
             return None
-        # Get bounding box of polygon in grid coords
         rows, cols = [], []
         for pt in ring:
             r, c = _to_rc(pt[1], pt[0])
@@ -1147,10 +1149,59 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         valid = block[block > 2.0]
         if len(valid) == 0:
             return None
-        # Use 90th percentile — captures real height of tall buildings
-        # while still filtering out occasional outlier pixels
-        val = float(np.percentile(valid, 90))
-        return val if val > 2.0 else None
+
+        # Estimate actual polygon area (Shoelace formula, approximate in meters)
+        area_m2 = 0.0
+        n_pts = len(ring)
+        cos_lat_a = math.cos(math.radians(ring[0][1])) if ring else 1
+        for idx_p in range(n_pts):
+            j_p = (idx_p + 1) % n_pts
+            x1 = ring[idx_p][0] * 111320 * cos_lat_a
+            y1 = ring[idx_p][1] * 111320
+            x2 = ring[j_p][0] * 111320 * cos_lat_a
+            y2 = ring[j_p][1] * 111320
+            area_m2 += x1 * y2 - x2 * y1
+        area_m2 = abs(area_m2) / 2
+
+        # Separate building height from tree canopy using variance analysis.
+        # Building roofs = uniform height (low variance cluster).
+        # Tree canopy = variable height (high variance, usually taller).
+        #
+        # Strategy: find the lowest significant height cluster.
+        # Buildings are almost always shorter than the trees above them.
+
+        if area_m2 > 500:
+            # Large building — use 90th percentile (unlikely to have tree cover)
+            return float(np.percentile(valid, 90))
+
+        # Bin heights into 1m intervals
+        bins = np.round(valid).astype(int)
+        unique, counts = np.unique(bins, return_counts=True)
+
+        if len(unique) == 1:
+            return float(unique[0])
+
+        # Find the lowest height cluster with significant pixel count.
+        # "Significant" = at least 15% of the total valid pixels.
+        # This is typically the building roof, not the tree canopy above.
+        min_count = max(2, int(len(valid) * 0.15))
+        building_h = None
+        for u, c in zip(unique, counts):
+            if c >= min_count:
+                building_h = float(u)
+                break
+
+        if building_h is None:
+            building_h = float(unique[np.argmax(counts)])
+
+        # Sanity check: if high variance exists and building_h is very high,
+        # there's likely a tree. Use the lower cluster.
+        std = float(np.std(valid))
+        if std > 3.0 and building_h > 8:
+            # High variance = mixed building+tree, take 25th percentile
+            building_h = float(np.percentile(valid, 25))
+
+        return building_h if building_h > 2.0 else None
 
     # Pass 3: assign heights
     filtered = []
@@ -1168,7 +1219,8 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
                 except (ValueError, TypeError):
                     pass
 
-        # Try LiDAR canopy height — sample max across polygon footprint
+        # Try LiDAR canopy height
+        btype = (props.get("TYPE_BATIMENT") or "").lower()
         if height is None:
             geom = feature["geometry"]
             coords = geom["coordinates"]
@@ -1177,10 +1229,21 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
             if lidar_h is not None:
                 height = round(lidar_h, 1)
 
+        # Apply height caps based on building type
+        # Garages/sheds/annexes should never be taller than ~5m
+        if height is not None:
+            if "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
+                height = min(height, 5.0)
+            elif "piscine" in btype:
+                height = min(height, 2.0)
+            elif "résidence" in btype or "residence" in btype:
+                height = min(height, 15.0)  # max 5 floors residential
+
         # Fallback by building type
         if height is None:
-            btype = (props.get("TYPE_BATIMENT") or "").lower()
-            if "commercial" in btype or "industriel" in btype:
+            if "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
+                height = 3.5
+            elif "commercial" in btype or "industriel" in btype:
                 height = 12.0
             elif "institutionnel" in btype or "public" in btype:
                 height = 15.0
@@ -1220,9 +1283,8 @@ _env_cache: dict = {}
 
 
 def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
-                               building_features: list):
-    """Detect individual trees from LiDAR MHC. Optimized with cv2 + numpy."""
-    import cv2
+                               building_features: list = None):
+    """Detect individual trees from LiDAR MHC. Optimized with numpy."""
     from scipy.ndimage import maximum_filter
 
     if not hasattr(terrain, 'read_block'):
@@ -1234,7 +1296,7 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     t0 = time.time()
 
     try:
-        max_px = min(2000, int(radius_km * 1000 / 5 * 2))
+        max_px = min(5000, int(radius_km * 1000 / 4))  # ~4m resolution, ~2.5GB RAM
         block = terrain.read_block(
             lat - lat_range, lon - lon_range,
             lat + lat_range, lon + lon_range,
@@ -1251,19 +1313,35 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     lon_min, lon_max_v = mhc_meta["lon_min"], mhc_meta["lon_max"]
     h, w = mhc_grid.shape
     res_m = mhc_meta.get("resolution_m", 5.0)
+
+    # Smart building mask: mask pixels where MHC height matches the building roof.
+    # If MHC >> building height, it's a tree overhanging, not the roof.
+    import cv2
+    bldg_height_grid = np.zeros((h, w), dtype=np.float32)  # expected building height per pixel
+    bldg_mask_raw = np.zeros((h, w), dtype=np.uint8)
     lat_scale = h / max(lat_max_v - lat_min, 1e-9)
     lon_scale = w / max(lon_max_v - lon_min, 1e-9)
 
-    # Building mask via cv2.fillPoly (>>100x faster than Python scanline)
-    bldg_mask = np.zeros((h, w), dtype=np.uint8)
-    polys = []
-    for feat in building_features:
+    # Group buildings by estimated height, then batch rasterize per group
+    height_groups: dict = {}  # est_h -> list of polygon pts
+    for feat in (building_features or []):
         geom = feat.get("geometry", {})
         coords = geom.get("coordinates", [])
+        btype = (feat.get("properties", {}).get("TYPE_BATIMENT") or "").lower()
         try:
             rings = [coords[0]] if geom["type"] == "Polygon" else [p[0] for p in coords]
         except (IndexError, KeyError):
             continue
+        if "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
+            est_h = 4.0
+        elif "piscine" in btype:
+            est_h = 1.5
+        elif "résidence" in btype or "residence" in btype:
+            est_h = 8.0
+        elif "commercial" in btype or "industriel" in btype:
+            est_h = 12.0
+        else:
+            est_h = 8.0
         for ring in rings:
             if len(ring) < 3:
                 continue
@@ -1271,30 +1349,72 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
                              int((lat_max_v - p[1]) * lat_scale)] for p in ring], dtype=np.int32)
             pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
             pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
-            polys.append(pts)
-    if polys:
-        cv2.fillPoly(bldg_mask, polys, 1)
-        cv2.dilate(bldg_mask, np.ones((3, 3), np.uint8), dst=bldg_mask, iterations=1)
+            height_groups.setdefault(est_h, []).append(pts)
+
+    # Batch rasterize: one fillPoly call per height group (fast!)
+    for est_h, poly_list in sorted(height_groups.items()):
+        cv2.fillPoly(bldg_mask_raw, poly_list, 1)
+        mask_this = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask_this, poly_list, 1)
+        bldg_height_grid = np.where(mask_this > 0, np.maximum(bldg_height_grid, est_h), bldg_height_grid)
+
+    # Smart mask: exclude pixel only if MHC is within 3m of building height (= roof)
+    # If MHC > building_height + 3m, it's a tree overhanging the building
+    roof_mask = (bldg_mask_raw > 0) & (mhc_grid <= bldg_height_grid + 3.0)
+
     t_mask = time.time()
 
-    # Tree detection: canopy > 2.5m, not NaN, not building, local max
-    tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (bldg_mask == 0)
+    # Tree detection: canopy > 2.5m, not NaN, not a roof pixel
+    tree_mask = (mhc_grid > 2.5) & (~np.isnan(mhc_grid)) & (~roof_mask)
     step = max(1, int(5.0 / max(res_m, 0.5)))
-    local_max = maximum_filter(mhc_grid, size=max(3, step)) == mhc_grid
-    combined = tree_mask & local_max
 
-    # Subsample
-    sampled = np.zeros_like(combined)
-    s2 = max(1, step // 2)
-    sampled[::s2, ::s2] = combined[::s2, ::s2]
+    # Local max among non-roof pixels only: zero out roofs before max filter
+    mhc_no_roof = mhc_grid.copy()
+    mhc_no_roof[roof_mask] = 0
+    local_max = maximum_filter(mhc_no_roof, size=max(3, step)) == mhc_no_roof
+    combined = tree_mask & local_max & (mhc_no_roof > 0)
+
+    # Subsample — pick highest tree per 4m cell (vectorized with block_reduce)
+    cell_m = 8.0  # 8m cells at 4m/px = cell_px=2, keeps highest tree per 8m
+    cell_px = max(2, int(cell_m / max(res_m, 0.5)))
+
+    # Zero out non-tree pixels, then find max position per cell
+    vals = np.where(combined, mhc_no_roof, 0)
+
+    # Trim grid to be divisible by cell_px
+    h_trim = (h // cell_px) * cell_px
+    w_trim = (w // cell_px) * cell_px
+    vals_t = vals[:h_trim, :w_trim]
+
+    # Reshape into cells and find argmax within each cell
+    cells = vals_t.reshape(h_trim // cell_px, cell_px, w_trim // cell_px, cell_px)
+    cells = cells.transpose(0, 2, 1, 3).reshape(-1, cell_px * cell_px)
+    cell_max = cells.max(axis=1)
+    cell_argmax = cells.argmax(axis=1)
+
+    # Convert back to full grid coords
+    n_cells_r = h_trim // cell_px
+    n_cells_c = w_trim // cell_px
+    cell_indices = np.arange(len(cell_max))
+    cell_r = cell_indices // n_cells_c
+    cell_c = cell_indices % n_cells_c
+    local_r = cell_argmax // cell_px
+    local_c = cell_argmax % cell_px
+    global_r = cell_r * cell_px + local_r
+    global_c = cell_c * cell_px + local_c
+
+    # Keep only cells with actual trees
+    valid_cells = cell_max > 2.5
+    sampled = np.zeros((h, w), dtype=bool)
+    sampled[global_r[valid_cells], global_c[valid_cells]] = True
 
     rows, cols = np.where(sampled)
-    heights = mhc_grid[rows, cols]
+    heights = mhc_no_roof[rows, cols]
     valid = (heights >= 2.5) & (heights <= 60)
     rows, cols, heights = rows[valid], cols[valid], heights[valid]
     t_detect = time.time()
 
-    # Vectorized coordinate conversion
+    # At 1m/pixel, pixel center is already ~0.5m accurate
     lats_arr = np.round(lat_max_v - (rows / h) * (lat_max_v - lat_min), 7)
     lons_arr = np.round(lon_min + (cols / w) * (lon_max_v - lon_min), 7)
     heights_r = np.round(heights, 1)
@@ -1313,7 +1433,7 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     t_json = time.time()
 
     logger.info(f"Trees: {len(features)} in {radius_km}km | "
-                f"lidar={int((t_lidar-t0)*1000)}ms mask={int((t_mask-t_lidar)*1000)}ms({len(polys)}p) "
+                f"lidar={int((t_lidar-t0)*1000)}ms mask={int((t_mask-t_lidar)*1000)}ms "
                 f"detect={int((t_detect-t_mask)*1000)}ms json={int((t_json-t_detect)*1000)}ms "
                 f"TOTAL={int((t_json-t0)*1000)}ms")
     return features
