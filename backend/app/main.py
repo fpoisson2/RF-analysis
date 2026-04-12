@@ -1296,7 +1296,7 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     t0 = time.time()
 
     try:
-        max_px = min(5000, int(radius_km * 1000 / 4))  # ~4m resolution, ~2.5GB RAM
+        max_px = min(10000, int(radius_km * 1000 / 2))  # ~2m resolution for dense tree detection
         block = terrain.read_block(
             lat - lat_range, lon - lon_range,
             lat + lat_range, lon + lon_range,
@@ -1375,7 +1375,7 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     combined = tree_mask & local_max & (mhc_no_roof > 0)
 
     # Subsample — pick highest tree per 4m cell (vectorized with block_reduce)
-    cell_m = 8.0  # 8m cells at 4m/px = cell_px=2, keeps highest tree per 8m
+    cell_m = 3.0  # 3m cells — ~2.1M trees at 10km radius for dense forest
     cell_px = max(2, int(cell_m / max(res_m, 0.5)))
 
     # Zero out non-tree pixels, then find max position per cell
@@ -1653,8 +1653,8 @@ def get_scene(lat: float, lon: float, radius_km: float = 2.0):
     """Combined endpoint: buildings + trees in compact binary format.
     Binary cached to disk for instant subsequent loads.
     Format: [magic:4] [n_bldg:u32] [n_trees:u32] [server_ms:f32]
-            then per building: [n_verts:u16] [height:f32] [lon,lat pairs as f32...]
-            then per tree: [lon:f32] [lat:f32] [height:f32]"""
+            then per building: [n_verts:u16] [height:f32] [ground_z:f32] [lon,lat pairs as f32...]
+            then per tree: [lon:f32] [lat:f32] [height:f32] [ground_z:f32]"""
     import struct
     from starlette.responses import Response
 
@@ -1676,12 +1676,14 @@ def get_scene(lat: float, lon: float, radius_km: float = 2.0):
 
     server_ms = (time.time() - t0) * 1000
 
-    # Build binary buffer
+    # Build binary buffer — write header placeholder, fill counts after
     buf = bytearray()
     buf.extend(b'SC3D')  # magic
-    buf.extend(struct.pack('<IIf', len(bldg_features), len(tree_features), server_ms))
+    header_off = len(buf)
+    buf.extend(struct.pack('<IIf', 0, 0, server_ms))  # placeholder counts
 
-    # Buildings
+    # Buildings — include ground elevation for proper terrain placement
+    actual_bldg = 0
     for feat in bldg_features:
         geom = feat.get("geometry", {})
         h = float(feat.get("properties", {}).get("_height", 8))
@@ -1693,15 +1695,32 @@ def get_scene(lat: float, lon: float, radius_km: float = 2.0):
         n = len(ring)
         if n < 3 or n > 65535:
             continue
-        buf.extend(struct.pack('<Hf', n, h))
+        # Sample terrain elevation at building centroid
+        clat = sum(p[1] for p in ring) / n
+        clon = sum(p[0] for p in ring) / n
+        try:
+            ground_z = float(terrain.get_elevation(clat, clon) or 0)
+        except Exception:
+            ground_z = 0.0
+        buf.extend(struct.pack('<Hff', n, h, ground_z))
         for p in ring:
             buf.extend(struct.pack('<ff', float(p[0]), float(p[1])))
+        actual_bldg += 1
 
-    # Trees
+    # Trees — include ground elevation too
+    actual_trees = 0
     for feat in tree_features:
         coords = feat.get("geometry", {}).get("coordinates", [0, 0])
         h = float(feat.get("properties", {}).get("h", 8))
-        buf.extend(struct.pack('<fff', float(coords[0]), float(coords[1]), h))
+        try:
+            ground_z = float(terrain.get_elevation(coords[1], coords[0]) or 0)
+        except Exception:
+            ground_z = 0.0
+        buf.extend(struct.pack('<ffff', float(coords[0]), float(coords[1]), h, ground_z))
+        actual_trees += 1
+
+    # Patch header with actual counts
+    struct.pack_into('<II', buf, header_off, actual_bldg, actual_trees)
 
     # Cache binary to disk
     try:
@@ -1711,7 +1730,7 @@ def get_scene(lat: float, lon: float, radius_km: float = 2.0):
     except Exception as e:
         logger.warning(f"Scene cache write failed: {e}")
 
-    logger.info(f"Scene binary: {len(bldg_features)} bldg + {len(tree_features)} trees = "
+    logger.info(f"Scene binary: {actual_bldg} bldg + {actual_trees} trees = "
                 f"{len(buf)/1e6:.1f}MB, server {server_ms:.0f}ms")
 
     return Response(

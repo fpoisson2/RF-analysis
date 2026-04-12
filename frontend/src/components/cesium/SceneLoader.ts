@@ -2,6 +2,7 @@ export interface ParsedBuilding {
   ring: number[];       // flat [lon0, lat0, lon1, lat1, ...] pairs
   nVerts: number;
   height: number;
+  groundZ: number;      // terrain elevation at centroid (meters)
   centroidLat: number;
   centroidLon: number;
 }
@@ -10,6 +11,7 @@ export interface ParsedTree {
   lon: number;
   lat: number;
   height: number;
+  groundZ: number;
 }
 
 export interface ParsedScene {
@@ -30,6 +32,7 @@ export function parseScene(buffer: ArrayBuffer): ParsedScene {
   for (let i = 0; i < nBldg; i++) {
     const nVerts = view.getUint16(off, true); off += 2;
     const height = view.getFloat32(off, true); off += 4;
+    const groundZ = view.getFloat32(off, true); off += 4;
     const ring: number[] = new Array(nVerts * 2);
     let cLat = 0, cLon = 0;
     for (let v = 0; v < nVerts; v++) {
@@ -44,6 +47,7 @@ export function parseScene(buffer: ArrayBuffer): ParsedScene {
       ring,
       nVerts,
       height,
+      groundZ,
       centroidLat: cLat / nVerts,
       centroidLon: cLon / nVerts,
     };
@@ -54,7 +58,8 @@ export function parseScene(buffer: ArrayBuffer): ParsedScene {
     const lon = view.getFloat32(off, true); off += 4;
     const lat = view.getFloat32(off, true); off += 4;
     const height = view.getFloat32(off, true); off += 4;
-    trees[i] = { lon, lat, height };
+    const groundZ = view.getFloat32(off, true); off += 4;
+    trees[i] = { lon, lat, height, groundZ };
   }
 
   return { buildings, trees, serverMs, byteLength: buffer.byteLength };

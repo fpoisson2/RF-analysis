@@ -2,7 +2,7 @@ import * as Cesium from 'cesium';
 import { ParsedBuilding } from './SceneLoader';
 
 const EXAG = 1.5;
-const CHUNK_SIZE = 5000; // buildings per Primitive
+const CHUNK_SIZE = 5000;
 
 export interface BuildingPrimitives {
   chunks: Cesium.Primitive[];
@@ -26,18 +26,26 @@ export function createBuildingPrimitives(
       const b = buildings[i];
       if (b.nVerts < 3) continue;
 
-      // Build polygon hierarchy from lon/lat ring
+      // Ground elevation from backend LiDAR MNT, with terrain exaggeration
+      const groundH = b.groundZ * EXAG;
+      const roofH = groundH + b.height * EXAG;
+
       const positions: Cesium.Cartesian3[] = [];
       for (let v = 0; v < b.nVerts; v++) {
-        positions.push(Cesium.Cartesian3.fromDegrees(b.ring[v * 2], b.ring[v * 2 + 1]));
+        positions.push(Cesium.Cartesian3.fromDegrees(
+          b.ring[v * 2],
+          b.ring[v * 2 + 1],
+          groundH,
+        ));
       }
 
       try {
         const instance = new Cesium.GeometryInstance({
           geometry: new Cesium.PolygonGeometry({
             polygonHierarchy: new Cesium.PolygonHierarchy(positions),
-            extrudedHeight: b.height * EXAG,
-            height: 0,
+            extrudedHeight: roofH,
+            height: groundH,
+            perPositionHeight: false,
             vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
           }),
           attributes: {
@@ -72,7 +80,9 @@ export function createBuildingPrimitives(
       console.warn(`Building primitive chunk ${ci} failed:`, e);
     }
 
-    console.log(`BuildingsMesh: chunk ${ci + 1}/${nChunks} (${instances.length} buildings)`);
+    if (ci % 10 === 0 || ci === nChunks - 1) {
+      console.log(`BuildingsMesh: chunk ${ci + 1}/${nChunks} (${instances.length} buildings)`);
+    }
   }
 
   console.log(`BuildingsMesh: ${buildings.length} buildings in ${chunks.length} primitives`);
@@ -98,7 +108,7 @@ export function recolorBuildings(
   return createBuildingPrimitives(buildings, viewer, signalValues);
 }
 
-// Signal color stops (same as Map.tsx COLOR_STOPS dBm)
+// Signal color interpolation
 const SIGNAL_STOPS: [number, [number, number, number, number]][] = [
   [-30, [255, 30, 30, 235]],
   [-50, [255, 110, 0, 230]],

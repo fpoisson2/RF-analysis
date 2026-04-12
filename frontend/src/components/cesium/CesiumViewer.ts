@@ -54,8 +54,8 @@ export function createCesiumViewer(options: CesiumViewerOptions): Cesium.Viewer 
     intensity: 2.0,
   });
 
-  // Globe settings
-  viewer.scene.globe.depthTestAgainstTerrain = true;
+  // Globe settings — disable depth test so buildings/trees are always visible at any zoom
+  viewer.scene.globe.depthTestAgainstTerrain = false;
   viewer.scene.globe.showGroundAtmosphere = false;
   viewer.scene.fog.enabled = false;
   if (viewer.scene.skyAtmosphere) {
