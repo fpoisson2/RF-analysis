@@ -47,7 +47,13 @@
       "Bash(powershell -Command 'Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue')",
       "Bash(powershell -Command \"Get-Process | Where-Object {$_ProcessName -like ''*node*''} | Select-Object Id, ProcessName, Path | Format-Table\")",
       "mcp__Claude_Preview__preview_start",
-      "Bash(curl -s http://localhost:5174)"
+      "Bash(curl -s http://localhost:5174)",
+      "Bash(cp C:/Users/franc/OneDrive/Documents/GitHub/RF-analysis/data/unreal/trees_ue/trees_ue.csv E:/rf_analysis/unreal/trees_ue/trees_ue.csv)",
+      "Read(//e/rf_analysis/unreal/trees_ue/**)",
+      "WebFetch(domain:dev.epicgames.com)",
+      "WebFetch(domain:cgecho.net)",
+      "WebFetch(domain:forums.unrealengine.com)",
+      "WebFetch(domain:medium.com)"
     ]
   }
 }

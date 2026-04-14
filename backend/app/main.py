@@ -22,6 +22,8 @@ from .terrain.lidar_terrain import LiDARTerrainManager
 from .propagation.models import MODELS, list_models
 from .propagation.diffraction import DIFFRACTION_MODELS
 from .gpu import gpu_status
+from .vegetation import vdq_trees, deepforest_trees
+from .vegetation.ecoforest import EcoforestIndex
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -1100,9 +1102,14 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         blk_lon_max = lon + lidar_lon_range
         pad = 0.001
         try:
+            # Use ~1 m/pixel so individual residences (≈10 m wide) still have
+            # 80–100 interior pixels after polygon masking + 1 px erosion.
+            # Scales with radius, capped at 10 000 px per side (matches the
+            # tree-detection cap) so memory stays bounded at 400 MB.
+            n_px = min(10000, int(max(radius_km * 1000, 1000)))
             block = terrain.read_block(blk_lat_min - pad, blk_lon_min - pad,
                                         blk_lat_max + pad, blk_lon_max + pad,
-                                        dataset_type="mhc", max_pixels=2000)
+                                        dataset_type="mhc", max_pixels=n_px)
             if block is not None:
                 mhc_grid, mhc_meta = block
         except Exception:
@@ -1124,84 +1131,78 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         c = max(0, min(c, mhc_grid.shape[1] - 1))
         return r, c
 
+    import cv2 as _cv2
+
     def _sample_mhc_polygon(ring):
-        """Sample building height from MHC, filtering out trees.
-        Strategy: estimate footprint area, then pick percentile accordingly.
-        - Large buildings (>200m²): 90th percentile (real height)
-        - Medium buildings (50-200m²): 50th percentile (median, avoids tree peaks)
-        - Small buildings (<50m²): 25th percentile (garage/shed, ignore trees above)
+        """Sample building height from MHC using only polygon-interior pixels.
+
+        Previous bbox-based sampling pulled in adjacent tree canopy, which
+        produced either 15 m "tree houses" on small sheds or biased 90th-
+        percentile heights that included overhanging branches.
+
+        New strategy:
+          1. Rasterize the polygon into the MHC grid with a 1 px erosion to
+             drop the edge pixels (often half roof / half ground).
+          2. Robust median of interior pixels above 1 m.
+          3. If the interior distribution is bimodal with a tall minority
+             (< 40 % of pixels above median + 3 m), treat the tall cluster
+             as an overhanging tree and use the lower cluster's median.
         """
         if mhc_grid is None:
             return None
-        rows, cols = [], []
+        h_grid, w_grid = mhc_grid.shape
+
+        # Rasterize the polygon at MHC resolution
+        pts = []
         for pt in ring:
             r, c = _to_rc(pt[1], pt[0])
-            if r is not None:
-                rows.append(r)
-                cols.append(c)
-        if not rows:
+            if r is None:
+                return None
+            pts.append([c, r])
+        if len(pts) < 3:
             return None
-        r_min, r_max = max(0, min(rows)), min(mhc_grid.shape[0] - 1, max(rows))
-        c_min, c_max = max(0, min(cols)), min(mhc_grid.shape[1] - 1, max(cols))
+        poly_arr = np.array([pts], dtype=np.int32)
+
+        # Tight bbox to keep the mask small
+        xs = poly_arr[0, :, 0]
+        ys = poly_arr[0, :, 1]
+        c_min, c_max = int(xs.min()), int(xs.max())
+        r_min, r_max = int(ys.min()), int(ys.max())
+        c_min = max(0, c_min); r_min = max(0, r_min)
+        c_max = min(w_grid - 1, c_max); r_max = min(h_grid - 1, r_max)
+        if c_max <= c_min or r_max <= r_min:
+            return None
+        sub_h = r_max - r_min + 1
+        sub_w = c_max - c_min + 1
+
+        mask = np.zeros((sub_h, sub_w), dtype=np.uint8)
+        shifted = poly_arr.copy()
+        shifted[0, :, 0] -= c_min
+        shifted[0, :, 1] -= r_min
+        _cv2.fillPoly(mask, shifted, 1)
+        # Erode by 1 px to avoid half-roof / half-ground edge pixels
+        if sub_h > 3 and sub_w > 3:
+            mask = _cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+            if mask.sum() == 0:
+                # Building too small after erosion — fall back to un-eroded
+                _cv2.fillPoly(mask, shifted, 1)
+
         block = mhc_grid[r_min:r_max + 1, c_min:c_max + 1]
-        if block.size == 0:
-            return None
-        valid = block[block > 2.0]
-        if len(valid) == 0:
+        interior = block[(mask > 0) & (block > 1.0)]
+        if interior.size < 2:
             return None
 
-        # Estimate actual polygon area (Shoelace formula, approximate in meters)
-        area_m2 = 0.0
-        n_pts = len(ring)
-        cos_lat_a = math.cos(math.radians(ring[0][1])) if ring else 1
-        for idx_p in range(n_pts):
-            j_p = (idx_p + 1) % n_pts
-            x1 = ring[idx_p][0] * 111320 * cos_lat_a
-            y1 = ring[idx_p][1] * 111320
-            x2 = ring[j_p][0] * 111320 * cos_lat_a
-            y2 = ring[j_p][1] * 111320
-            area_m2 += x1 * y2 - x2 * y1
-        area_m2 = abs(area_m2) / 2
-
-        # Separate building height from tree canopy using variance analysis.
-        # Building roofs = uniform height (low variance cluster).
-        # Tree canopy = variable height (high variance, usually taller).
-        #
-        # Strategy: find the lowest significant height cluster.
-        # Buildings are almost always shorter than the trees above them.
-
-        if area_m2 > 500:
-            # Large building — use 90th percentile (unlikely to have tree cover)
-            return float(np.percentile(valid, 90))
-
-        # Bin heights into 1m intervals
-        bins = np.round(valid).astype(int)
-        unique, counts = np.unique(bins, return_counts=True)
-
-        if len(unique) == 1:
-            return float(unique[0])
-
-        # Find the lowest height cluster with significant pixel count.
-        # "Significant" = at least 15% of the total valid pixels.
-        # This is typically the building roof, not the tree canopy above.
-        min_count = max(2, int(len(valid) * 0.15))
-        building_h = None
-        for u, c in zip(unique, counts):
-            if c >= min_count:
-                building_h = float(u)
-                break
-
-        if building_h is None:
-            building_h = float(unique[np.argmax(counts)])
-
-        # Sanity check: if high variance exists and building_h is very high,
-        # there's likely a tree. Use the lower cluster.
-        std = float(np.std(valid))
-        if std > 3.0 and building_h > 8:
-            # High variance = mixed building+tree, take 25th percentile
-            building_h = float(np.percentile(valid, 25))
-
-        return building_h if building_h > 2.0 else None
+        # The footprint has been eroded by 1 px so remaining pixels are
+        # ≥ 1 m inside the polygon — tree-overhang contamination there is
+        # rare. The building's real roof = the tallest *stable* surface
+        # inside the footprint, so we use the 90th percentile (robust to a
+        # couple of spurious high-noise pixels but still catches multi-
+        # storey add-ons like a 3rd-storey over a 2-storey base).
+        p90 = float(np.percentile(interior, 90))
+        # For very uniform roofs, p90 == median == answer. For mixed roofs
+        # (e.g. main building + lower annex in the same polygon), p90
+        # correctly reports the tallest portion.
+        return p90 if p90 > 1.0 else None
 
     # Pass 3: assign heights
     filtered = []
@@ -1209,35 +1210,38 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
         props = feature.get("properties", {})
         height = None
 
-        # Try explicit height properties
-        for hk in ["ELEVATION", "HAUTEUR", "hauteur", "HEIGHT", "NB_ETAGES"]:
-            if hk in props and props[hk]:
-                try:
-                    val = float(props[hk])
-                    height = val if hk != "NB_ETAGES" else val * 3.0
-                    break
-                except (ValueError, TypeError):
-                    pass
-
-        # Try LiDAR canopy height
         btype = (props.get("TYPE_BATIMENT") or "").lower()
-        if height is None:
-            geom = feature["geometry"]
-            coords = geom["coordinates"]
-            ring = coords[0] if geom["type"] == "Polygon" else coords[0][0]
-            lidar_h = _sample_mhc_polygon(ring)
-            if lidar_h is not None:
-                height = round(lidar_h, 1)
 
-        # Apply height caps based on building type
-        # Garages/sheds/annexes should never be taller than ~5m
+        # Prefer LiDAR (measured) over GeoJSON attributes (often missing or
+        # stale) when we have MHC coverage. Attribute fallback only if LiDAR
+        # returns nothing.
+        geom = feature["geometry"]
+        coords = geom["coordinates"]
+        ring = coords[0] if geom["type"] == "Polygon" else coords[0][0]
+        lidar_h = _sample_mhc_polygon(ring)
+        if lidar_h is not None:
+            height = round(lidar_h, 1)
+
+        # GeoJSON attribute fallback: only when LiDAR failed
+        if height is None:
+            for hk in ["ELEVATION", "HAUTEUR", "hauteur", "HEIGHT", "NB_ETAGES"]:
+                if hk in props and props[hk]:
+                    try:
+                        val = float(props[hk])
+                        # NB_ETAGES: 3.0 m/floor + 1 m base (foundation/parapet)
+                        height = (val * 3.0 + 1.0) if hk == "NB_ETAGES" else val
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        # Type-aware caps. Quebec has many 3–8 storey residential buildings
+        # (condos, apartments) so we only cap egregious LiDAR outliers on
+        # small ancillary structures — we do NOT cap "résidence" globally.
         if height is not None:
             if "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
                 height = min(height, 5.0)
             elif "piscine" in btype:
                 height = min(height, 2.0)
-            elif "résidence" in btype or "residence" in btype:
-                height = min(height, 15.0)  # max 5 floors residential
 
         # Fallback by building type
         if height is None:
@@ -1280,6 +1284,43 @@ def get_buildings(lat: float, lon: float, radius_km: float = 2.0):
 # Individual trees from LiDAR MHC (for 3-D rendering)
 # ---------------------------------------------------------------------------
 _env_cache: dict = {}
+_ecoforest_index: dict = {"loaded": False, "idx": None}
+
+
+def _get_ecoforest() -> EcoforestIndex | None:
+    if not _ecoforest_index["loaded"]:
+        _ecoforest_index["idx"] = EcoforestIndex.from_default_data_dir()
+        _ecoforest_index["loaded"] = True
+    return _ecoforest_index["idx"]
+
+
+@app.get("/api/data/ecoforest")
+def get_ecoforest(lat: float, lon: float, radius_km: float = 2.0):
+    """Return MRNF ecoforest stand polygons within the bbox, with per-polygon
+    specific attenuation (dB/m) derived from CL_HAUT / CL_DENS / GR_ESS."""
+    idx = _get_ecoforest()
+    if idx is None:
+        return {"type": "FeatureCollection", "features": [],
+                "note": "ecoforest data missing — run scripts/download_data.py"}
+    cos_lat = math.cos(math.radians(lat))
+    lat_r = radius_km / 111.32
+    lon_r = radius_km / (111.32 * cos_lat)
+    polys = idx.query_bbox(lat - lat_r, lon - lon_r, lat + lat_r, lon + lon_r)
+    feats = []
+    for p in polys:
+        feats.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [p.ring]},
+            "properties": {
+                "cl_haut": p.cl_haut,
+                "cl_dens": p.cl_dens,
+                "gr_ess": p.gr_ess,
+                "h": p.height_m,
+                "atten_db_m": round(p.atten_db_m, 4),
+            },
+        })
+    return {"type": "FeatureCollection", "features": feats,
+            "counts": {"polygons": len(feats)}}
 
 
 def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
@@ -1322,17 +1363,26 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
     lat_scale = h / max(lat_max_v - lat_min, 1e-9)
     lon_scale = w / max(lon_max_v - lon_min, 1e-9)
 
-    # Group buildings by estimated height, then batch rasterize per group
+    # Group buildings by height, then batch rasterize per group.
+    # Prefer the real LiDAR-derived `_height` (from get_buildings); fall back to a
+    # conservative type-based estimate only if missing.
     height_groups: dict = {}  # est_h -> list of polygon pts
     for feat in (building_features or []):
         geom = feat.get("geometry", {})
         coords = geom.get("coordinates", [])
-        btype = (feat.get("properties", {}).get("TYPE_BATIMENT") or "").lower()
+        props = feat.get("properties", {})
+        btype = (props.get("TYPE_BATIMENT") or "").lower()
         try:
             rings = [coords[0]] if geom["type"] == "Polygon" else [p[0] for p in coords]
         except (IndexError, KeyError):
             continue
-        if "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
+        real_h = props.get("_height") or props.get("h")
+        if real_h is not None:
+            try:
+                est_h = float(real_h)
+            except (TypeError, ValueError):
+                est_h = 8.0
+        elif "garage" in btype or "annexe" in btype or "remise" in btype or "cabanon" in btype:
             est_h = 4.0
         elif "piscine" in btype:
             est_h = 1.5
@@ -1342,6 +1392,8 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
             est_h = 12.0
         else:
             est_h = 8.0
+        # Round to 1m bins so we don't explode the number of rasterize groups
+        est_h = round(est_h)
         for ring in rings:
             if len(ring) < 3:
                 continue
@@ -1358,9 +1410,20 @@ def _extract_trees_from_lidar(lat: float, lon: float, radius_km: float,
         cv2.fillPoly(mask_this, poly_list, 1)
         bldg_height_grid = np.where(mask_this > 0, np.maximum(bldg_height_grid, est_h), bldg_height_grid)
 
-    # Smart mask: exclude pixel only if MHC is within 3m of building height (= roof)
-    # If MHC > building_height + 3m, it's a tree overhanging the building
-    roof_mask = (bldg_mask_raw > 0) & (mhc_grid <= bldg_height_grid + 3.0)
+    # Dilate the building footprint by ~2m to tolerate LiDAR georeferencing error
+    # (building polygons and MHC raster are often misaligned by 0.5–1.5 m, which
+    # caused "trees growing on rooftops" in the 3D view).
+    dilate_px = max(1, int(round(2.0 / max(res_m, 0.5))))
+    k = 2 * dilate_px + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    bldg_mask_dil = cv2.dilate(bldg_mask_raw, kernel, iterations=1)
+    bldg_height_grid = cv2.dilate(bldg_height_grid, kernel, iterations=1)
+
+    # Any pixel inside a (dilated) building footprint whose MHC is not clearly
+    # *above* the roof is treated as roof — masked out. We only keep it as "tree"
+    # if MHC is at least 4 m above the estimated roof, which is a real canopy
+    # overhanging the building (rare, but legitimate).
+    roof_mask = (bldg_mask_dil > 0) & (mhc_grid <= bldg_height_grid + 4.0)
 
     t_mask = time.time()
 
@@ -1466,27 +1529,25 @@ def get_environment(lat: float, lon: float, radius_km: float = 2.0):
                        {"cached": True, "disk": True, "trees": result.get("counts", {}).get("trees", 0)})
         return result
 
-    # Get building features to exclude from tree detection
-    building_features = []
-    local_bldg = _load_local_buildings()
-    if local_bldg and "features" in local_bldg:
-        cos_lat_v = math.cos(math.radians(lat))
-        lat_r = radius_km / 111.32
-        lon_r = radius_km / (111.32 * cos_lat_v)
-        for f in local_bldg["features"]:
-            g = f.get("geometry")
-            if not g:
-                continue
-            try:
-                ring = g["coordinates"][0] if g["type"] == "Polygon" else g["coordinates"][0][0]
-                clat = sum(p[1] for p in ring) / len(ring)
-                clon = sum(p[0] for p in ring) / len(ring)
-                if abs(clat - lat) <= lat_r and abs(clon - lon) <= lon_r:
-                    building_features.append(f)
-            except (IndexError, KeyError, TypeError):
-                continue
+    # Get buildings WITH LiDAR-derived `_height` so the tree mask uses real heights
+    # (not just an 8m-per-residence heuristic which leaves tall buildings "covered in trees").
+    bldg_data = get_buildings(lat, lon, radius_km)
+    building_features = bldg_data.get("features", []) if bldg_data else []
 
     trees = _extract_trees_from_lidar(lat, lon, radius_km, building_features)
+
+    # Merge the Ville de Quebec municipal inventory: better species + DHP data
+    # for urban trees, dedups any LiDAR tree within 3m of a municipal one.
+    try:
+        trees = vdq_trees.merge_with_lidar(trees, lat, lon, radius_km)
+    except Exception as e:
+        logger.warning("VdQ merge failed: %s", e)
+    # DeepForest detections (populated by scripts/run_deepforest.py). Gives
+    # individual tree crowns in the non-municipal gaps.
+    try:
+        trees = deepforest_trees.merge_with_lidar(trees, lat, lon, radius_km)
+    except Exception as e:
+        logger.warning("DeepForest merge failed: %s", e)
 
     result = {
         "trees": {"type": "FeatureCollection", "features": trees},
