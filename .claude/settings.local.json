@@ -53,7 +53,9 @@
       "WebFetch(domain:dev.epicgames.com)",
       "WebFetch(domain:cgecho.net)",
       "WebFetch(domain:forums.unrealengine.com)",
-      "WebFetch(domain:medium.com)"
+      "WebFetch(domain:medium.com)",
+      "Read(//e/rf_analysis/data_backup//**)",
+      "Read(//e/rf_analysis/data_backup/lidar/**)"
     ]
   }
 }

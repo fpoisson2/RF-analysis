@@ -10,10 +10,11 @@ venv/
 node_modules/
 frontend/dist/
 
-# Data (large files - download separately)
+# Data (large files - fetched via scripts/fetch_data.py, see data/README.md)
 data/srtm/*.hgt
 data/srtm/*.hgt.gz
 data/buildings/*.geojson
+data/buildings/*.geojson.gz
 data/landcover/
 data/lidar/
 data/cache/
@@ -21,6 +22,7 @@ data/output/
 data/quebec/
 data/unreal/
 data/vegetation/
+!data/README.md
 
 # ML training logs
 lightning_logs/
