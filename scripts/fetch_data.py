@@ -42,7 +42,7 @@ LIDAR_TILES = [
 # GitHub Release tag hosting the compressed buildings GeoJSON.
 # Create with:  gh release create data-v1 data/buildings/quebec_city_batiments.geojson.gz
 RELEASE_TAG = "data-v1"
-RELEASE_REPO = "francispg/RF-analysis"  # adjust if fork
+RELEASE_REPO = "fpoisson2/RF-analysis"  # adjust if fork
 BUILDINGS_URL = (
     f"https://github.com/{RELEASE_REPO}/releases/download/{RELEASE_TAG}/"
     "quebec_city_batiments.geojson.gz"
