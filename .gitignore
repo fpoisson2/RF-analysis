@@ -20,6 +20,7 @@ data/cache/
 data/output/
 data/quebec/
 data/unreal/
+data/vegetation/
 
 # ML training logs
 lightning_logs/
