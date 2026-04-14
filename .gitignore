@@ -19,6 +19,13 @@ data/lidar/
 data/cache/
 data/output/
 data/quebec/
+data/unreal/
+
+# ML training logs
+lightning_logs/
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
 
 # IDE
 .vscode/
