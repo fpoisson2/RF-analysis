@@ -1,12 +1,16 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as Cesium from 'cesium';
 import { AreaResponse } from '../types';
 import { Locale, t } from '../i18n';
 import { Layers, Mountain, TreePine, Building2, X, Box, Route } from 'lucide-react';
 import { createCesiumViewer, swapBaseImagery, destroyCesiumViewer } from './cesium/CesiumViewer';
+import { HoverReadout, HoverSample } from './HoverReadout';
 import { addCoverageLayer, removeCoverageLayer } from './cesium/CoverageLayer';
 import { addTerrainOverlay, removeTerrainOverlay } from './cesium/TerrainOverlayLayer';
 import { createTxMarker, updateTxMarkerPosition, TxMarkerHandle } from './cesium/TxMarker';
+import { createRxMarker, RxMarkerHandle } from './cesium/RxMarker';
+import { createPathLine, PathLineHandle } from './cesium/PathLine';
+import { PathResponse } from '../types';
 import { parseScene, shouldReloadScene, ParsedBuilding, ParsedScene } from './cesium/SceneLoader';
 import { createBuildingPrimitives, recolorBuildings, BuildingPrimitives } from './cesium/BuildingsMesh';
 import { createTreePrimitives, TreePrimitives } from './cesium/TreesMesh';
@@ -14,8 +18,17 @@ import { sampleBuildingSignals } from './cesium/CoverageColoring';
 
 interface MapProps {
   onMapClick: (lat: number, lon: number) => void;
+  onTxDragEnd: (lat: number, lon: number) => void;
+  onRxDragEnd: (id: string, lat: number, lon: number) => void;
+  onRxSelect: (id: string) => void;
   txPosition: [number, number]; // [lon, lat]
+  rxPositions: Array<{ id: string; lat: number; lon: number }>;
+  selectedRxId: string | null;
+  placementMode: 'tx' | 'rx' | null;
+  pathResult: PathResponse | null;
+  pathHoverDistance: number | null;
   coverageResult: AreaResponse | null;
+  noiseFloor: number;
   darkMode: boolean;
   locale: Locale;
   outputUnits: string;
@@ -91,14 +104,30 @@ const COLOR_STOPS: Record<string, { label: string; stops: [number, string][] }> 
 };
 
 export const MapView = React.memo(function MapView({
-  onMapClick, txPosition, coverageResult, darkMode, locale, outputUnits,
+  onMapClick, onTxDragEnd, onRxDragEnd, onRxSelect, txPosition, rxPositions, selectedRxId, placementMode, pathResult, pathHoverDistance,
+  coverageResult, noiseFloor, darkMode, locale, outputUnits,
   terrainLayer, onTerrainLayerChange, hasLidar, radius,
 }: MapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const coordsRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<Cesium.Viewer | null>(null);
   const markerRef = useRef<TxMarkerHandle | null>(null);
+  const rxMarkersRef = useRef<Map<string, RxMarkerHandle>>(new globalThis.Map());
+  const pathLineRef = useRef<PathLineHandle | null>(null);
   const onMapClickRef = useRef(onMapClick);
+  const onTxDragEndRef = useRef(onTxDragEnd);
+  const onRxDragEndRef = useRef(onRxDragEnd);
+  const onRxSelectRef = useRef(onRxSelect);
+  const placementModeRef = useRef(placementMode);
+  onMapClickRef.current = onMapClick;
+  onTxDragEndRef.current = onTxDragEnd;
+  onRxDragEndRef.current = onRxDragEnd;
+  onRxSelectRef.current = onRxSelect;
+  placementModeRef.current = placementMode;
+
+  const [hoverSample, setHoverSample] = useState<HoverSample | null>(null);
+  const hoverPendingRef = useRef<{ lat: number; lon: number; x: number; y: number } | null>(null);
+  const hoverTimerRef = useRef<number | null>(null);
 
   const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const [loadingTerrain, setLoadingTerrain] = useState(false);
@@ -140,10 +169,12 @@ export const MapView = React.memo(function MapView({
       const cartesian = viewer.scene.globe.pick(ray, viewer.scene);
       if (!cartesian) return;
       const carto = Cesium.Cartographic.fromCartesian(cartesian);
+      const lat = Cesium.Math.toDegrees(carto.latitude);
+      const lon = Cesium.Math.toDegrees(carto.longitude);
       if (coordsRef.current) {
-        coordsRef.current.textContent =
-          `${Cesium.Math.toDegrees(carto.latitude).toFixed(6)}, ${Cesium.Math.toDegrees(carto.longitude).toFixed(6)}`;
+        coordsRef.current.textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
       }
+      hoverPendingRef.current = { lat, lon, x: movement.endPosition.x, y: movement.endPosition.y };
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
 
     // Center coordinates update on camera move
@@ -164,14 +195,18 @@ export const MapView = React.memo(function MapView({
     };
     viewer.camera.moveEnd.addEventListener(updateCenter);
 
-    // TX marker
+    // TX marker — drag moves TX directly; clicks on map go through placement-mode logic
     const marker = createTxMarker(
       viewer,
       txPosition,
-      (lat, lon) => onMapClickRef.current(lat, lon),
+      (lat, lon) => onTxDragEndRef.current(lat, lon),
       (lat, lon) => onMapClickRef.current(lat, lon),
     );
     markerRef.current = marker;
+
+    // RX markers are managed in a separate effect (one per position).
+    // Path line overlay
+    pathLineRef.current = createPathLine(viewer);
 
     const tMap = performance.now() - loadStartRef.current;
     setLoadMetrics(m => ({ ...m, map: Math.round(tMap) }));
@@ -184,6 +219,10 @@ export const MapView = React.memo(function MapView({
       viewer.camera.moveEnd.removeEventListener(updateCenter);
       marker.destroy();
       markerRef.current = null;
+      for (const m of rxMarkersRef.current.values()) m.destroy();
+      rxMarkersRef.current.clear();
+      pathLineRef.current?.destroy();
+      pathLineRef.current = null;
       buildingPrimRef.current?.destroy(viewer);
       buildingPrimRef.current = null;
       treePrimRef.current?.destroy(viewer);
@@ -366,6 +405,120 @@ export const MapView = React.memo(function MapView({
     viewerRef.current?.scene.requestRender();
   }, [showVegetation, viewerReady]);
 
+  // Sync RX markers (add/remove/update) with rxPositions list.
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || viewerReady === 0) return;
+    const map = rxMarkersRef.current;
+    const seen = new Set<string>();
+
+    for (const p of rxPositions) {
+      seen.add(p.id);
+      let m = map.get(p.id);
+      if (!m) {
+        m = createRxMarker(viewer, [p.lon, p.lat], (lat, lon) => {
+          onRxDragEndRef.current(p.id, lat, lon);
+        });
+        // Click on marker selects this RX
+        const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas as HTMLCanvasElement);
+        handler.setInputAction((click: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
+          const picked = viewer.scene.pick(click.position);
+          if (Cesium.defined(picked) && picked.id === m!.entity) {
+            onRxSelectRef.current(p.id);
+          }
+        }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+        // attach handler to marker for cleanup
+        const origDestroy = m.destroy;
+        m.destroy = () => { handler.destroy(); origDestroy(); };
+        map.set(p.id, m);
+      } else {
+        m.setPosition(p.lat, p.lon);
+      }
+      // Visual highlight for selected
+      const isSel = p.id === selectedRxId;
+      if (m.entity.billboard) m.entity.billboard.scale = (isSel ? 0.6 : 0.45) as any;
+    }
+
+    // Remove markers no longer in the list
+    for (const [id, m] of map.entries()) {
+      if (!seen.has(id)) { m.destroy(); map.delete(id); }
+    }
+    viewer.scene.requestRender();
+  }, [rxPositions, selectedRxId, viewerReady]);
+
+  // Update path line when path or endpoints change
+  const selectedRxPos = useMemo(() => {
+    const p = rxPositions.find(p => p.id === selectedRxId);
+    return p ? [p.lon, p.lat] as [number, number] : null;
+  }, [rxPositions, selectedRxId]);
+
+  useEffect(() => {
+    const line = pathLineRef.current;
+    if (!line) return;
+    if (selectedRxPos && pathResult) {
+      line.update(txPosition, selectedRxPos, pathResult);
+    } else {
+      line.update(txPosition, selectedRxPos || txPosition, null);
+    }
+  }, [pathResult, txPosition[0], txPosition[1], selectedRxPos?.[0], selectedRxPos?.[1], viewerReady]);
+
+  // Hover marker on path line
+  useEffect(() => {
+    pathLineRef.current?.setHover(pathHoverDistance);
+  }, [pathHoverDistance]);
+
+  // Throttled hover sampling (every 120ms) — only when coverage exists
+  useEffect(() => {
+    if (!coverageResult) {
+      setHoverSample(null);
+      if (hoverTimerRef.current) {
+        window.clearInterval(hoverTimerRef.current);
+        hoverTimerRef.current = null;
+      }
+      return;
+    }
+    let inFlight = false;
+    const tick = async () => {
+      const pending = hoverPendingRef.current;
+      if (!pending || inFlight) return;
+      inFlight = true;
+      try {
+        const res = await fetch('/api/coverage/sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ points: [[pending.lat, pending.lon]] }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const val = data.values?.[0];
+        setHoverSample({
+          lat: pending.lat,
+          lon: pending.lon,
+          signal_dbm: typeof val === 'number' ? val : null,
+          screenX: pending.x,
+          screenY: pending.y,
+        });
+      } catch {}
+      finally { inFlight = false; }
+    };
+    hoverTimerRef.current = window.setInterval(tick, 120);
+    return () => {
+      if (hoverTimerRef.current) {
+        window.clearInterval(hoverTimerRef.current);
+        hoverTimerRef.current = null;
+      }
+    };
+  }, [coverageResult]);
+
+  // Cursor feedback for placement mode
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    const canvas = viewer.scene.canvas as HTMLCanvasElement;
+    canvas.style.cursor = placementMode ? 'crosshair' : '';
+    return () => { canvas.style.cursor = ''; };
+  }, [placementMode, viewerReady]);
+
   const stops = COLOR_STOPS[outputUnits] || COLOR_STOPS['dBm'];
   const fr = locale === 'fr';
 
@@ -525,6 +678,26 @@ export const MapView = React.memo(function MapView({
       <div className="absolute bottom-8 left-2 bg-surface-2/90 backdrop-blur-sm px-3 py-1.5 rounded-lg text-xs font-mono text-gray-300 border border-gray-700/50 pointer-events-none z-10">
         <span ref={coordsRef}>{t('map.click_to_place', locale)}</span>
       </div>
+
+      {/* Placement-mode banner */}
+      {placementMode && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg shadow-lg border text-xs font-semibold pointer-events-none flex items-center gap-2"
+             style={{
+               backgroundColor: placementMode === 'rx' ? 'rgba(59,130,246,0.95)' : 'rgba(249,115,22,0.95)',
+               borderColor: 'white',
+               color: 'white',
+             }}>
+          <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+          {placementMode === 'rx'
+            ? (fr ? 'Cliquer pour placer le récepteur (Échap pour annuler)' : 'Click to place receiver (Esc to cancel)')
+            : (fr ? 'Cliquer pour placer l\'émetteur (Échap pour annuler)' : 'Click to place transmitter (Esc to cancel)')}
+        </div>
+      )}
+
+      {/* Hover readout */}
+      {coverageResult && (
+        <HoverReadout sample={hoverSample} coverageResult={coverageResult} noiseFloor={noiseFloor} locale={locale} />
+      )}
 
       {/* Stats overlay */}
       <div className="absolute bottom-8 right-2 bg-surface-2/90 backdrop-blur-sm px-3 py-2 rounded-lg text-[11px] font-mono text-gray-400 border border-gray-700/50 pointer-events-none z-10 space-y-0.5">

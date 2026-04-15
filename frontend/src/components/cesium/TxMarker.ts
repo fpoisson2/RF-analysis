@@ -154,7 +154,8 @@ export function createTxMarker(
     }
   }, Cesium.ScreenSpaceEventType.LEFT_UP);
 
-  // Click-to-place (on globe, not on marker)
+  // Click on map — delegated to caller so it can decide based on placement mode.
+  // The marker itself only moves via drag; map clicks go through onClick.
   handler.setInputAction((click: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
     if (dragging) return;
     const picked = viewer.scene.pick(click.position);
@@ -169,9 +170,7 @@ export function createTxMarker(
     const lat = Cesium.Math.toDegrees(carto.latitude);
     const lon = Cesium.Math.toDegrees(carto.longitude);
 
-    entity.position = cartesian as any;
     onClick(lat, lon);
-    viewer.scene.requestRender();
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
   return {

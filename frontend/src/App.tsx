@@ -2,11 +2,12 @@ import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { MapView } from './components/Map';
 import { Sidebar } from './components/Sidebar';
 import { Console } from './components/Console';
+import { PathProfilePanel } from './components/PathProfilePanel';
 import {
   Transmitter, Signal, Feeder, Antenna, Receiver,
-  PropagationModel, Environment, OutputConfig, TabId, AreaResponse,
+  PropagationModel, Environment, OutputConfig, TabId, AreaResponse, PathResponse,
 } from './types';
-import { calculateArea, getHealth } from './api/client';
+import { calculateArea, calculatePath, getHealth } from './api/client';
 import { t, getLocale, setLocale, Locale } from './i18n';
 import { Radio, Sun, Moon, HelpCircle, Zap, Globe } from 'lucide-react';
 
@@ -31,6 +32,17 @@ export default function App() {
   const [terrainLayer, setTerrainLayer] = useState<string | null>(null); // null, 'elevation', 'canopy', 'surface'
   const [hasLidar, setHasLidar] = useState(false);
   const [gpuName, setGpuName] = useState<string | null>(null);
+  const [placementMode, setPlacementMode] = useState<'tx' | 'rx' | null>(null);
+  const [pathResult, setPathResult] = useState<PathResponse | null>(null);
+  const [pathLoading, setPathLoading] = useState(false);
+  const [pathHover, setPathHover] = useState<number | null>(null);
+
+  // Receiver positions (multiple). The Receiver template holds shared
+  // height/gain/sensitivity; each entry just adds a (lat,lon,id).
+  const [rxPositions, setRxPositions] = useState<Array<{ id: string; lat: number; lon: number }>>([]);
+  const [selectedRxId, setSelectedRxId] = useState<string | null>(null);
+  // Per-RX computed signal values (ITM only + with diffraction)
+  const [rxSignals, setRxSignals] = useState<Record<string, { itm: number; fresnel: number; clear: boolean }>>({});
 
   const [tx, setTx] = useState<Transmitter>(DEFAULT_TX);
   const [signal, setSignal] = useState<Signal>(DEFAULT_SIGNAL);
@@ -57,9 +69,111 @@ export default function App() {
   }, []);
 
   const handleMapClick = useCallback((lat: number, lon: number) => {
-    setTx(prev => ({ ...prev, lat: parseFloat(lat.toFixed(6)), lon: parseFloat(lon.toFixed(6)) }));
-    log(`${i('console.tx_moved')} ${lat.toFixed(6)}, ${lon.toFixed(6)}`);
+    if (!placementMode) return;
+    const rLat = parseFloat(lat.toFixed(6));
+    const rLon = parseFloat(lon.toFixed(6));
+    if (placementMode === 'rx') {
+      // Adds a NEW receiver at the clicked point. Multiple RXs supported.
+      const id = `rx-${Date.now().toString(36)}`;
+      setRxPositions(prev => [...prev, { id, lat: rLat, lon: rLon }]);
+      setSelectedRxId(id);
+      log(`+RX${rxPositions.length + 1} → ${rLat}, ${rLon}`);
+    } else {
+      setTx(prev => ({ ...prev, lat: rLat, lon: rLon }));
+      log(`${i('console.tx_moved')} ${rLat}, ${rLon}`);
+    }
+    setPlacementMode(null);
+  }, [log, i, placementMode, rxPositions.length]);
+
+  const handleTxDragEnd = useCallback((lat: number, lon: number) => {
+    const rLat = parseFloat(lat.toFixed(6));
+    const rLon = parseFloat(lon.toFixed(6));
+    setTx(prev => ({ ...prev, lat: rLat, lon: rLon }));
+    log(`${i('console.tx_moved')} ${rLat}, ${rLon}`);
   }, [log, i]);
+
+  const handleRxDragEnd = useCallback((id: string, lat: number, lon: number) => {
+    const rLat = parseFloat(lat.toFixed(6));
+    const rLon = parseFloat(lon.toFixed(6));
+    setRxPositions(prev => prev.map(p => p.id === id ? { ...p, lat: rLat, lon: rLon } : p));
+    log(`RX → ${rLat}, ${rLon}`);
+  }, [log]);
+
+  const handleRxSelect = useCallback((id: string) => setSelectedRxId(id), []);
+  const handleRxRemove = useCallback((id: string) => {
+    setRxPositions(prev => prev.filter(p => p.id !== id));
+    setSelectedRxId(prev => (prev === id ? null : prev));
+  }, []);
+  const handleRxClearAll = useCallback(() => {
+    setRxPositions([]);
+    setSelectedRxId(null);
+    setPathResult(null);
+  }, []);
+
+  // Cancel placement with Escape
+  useEffect(() => {
+    if (!placementMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPlacementMode(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [placementMode]);
+
+  // Auto-select first RX if none selected
+  useEffect(() => {
+    if (rxPositions.length === 0) {
+      setSelectedRxId(null);
+      setPathResult(null);
+    } else if (!selectedRxId || !rxPositions.find(p => p.id === selectedRxId)) {
+      setSelectedRxId(rxPositions[0].id);
+    }
+  }, [rxPositions, selectedRxId]);
+
+  const selectedRx = useMemo(
+    () => rxPositions.find(p => p.id === selectedRxId) ?? null,
+    [rxPositions, selectedRxId],
+  );
+
+  // Compute paths for ALL RX positions (parallel). Store signal values per RX
+  // for the sidebar list, and the full result for the selected one.
+  useEffect(() => {
+    if (rxPositions.length === 0) {
+      setPathResult(null);
+      setRxSignals({});
+      return;
+    }
+    let cancelled = false;
+    setPathLoading(true);
+    const baseReq = { transmitter: tx, signal, feeder, antenna, model, environment: env };
+
+    Promise.all(rxPositions.map(p =>
+      calculatePath({ ...baseReq, receiver: { ...rx, lat: p.lat, lon: p.lon } })
+        .then(res => ({ id: p.id, res }))
+        .catch(() => ({ id: p.id, res: null as PathResponse | null }))
+    )).then(results => {
+      if (cancelled) return;
+      const sigs: Record<string, { itm: number; fresnel: number; clear: boolean }> = {};
+      let selectedRes: PathResponse | null = null;
+      for (const { id, res } of results) {
+        if (!res) continue;
+        const s = res.stats;
+        sigs[id] = {
+          itm: s.signal_at_rx_itm ?? s.signal_at_rx,
+          fresnel: s.signal_at_rx,
+          clear: !!s.clear_path,
+        };
+        if (id === selectedRxId) selectedRes = res;
+      }
+      setRxSignals(sigs);
+      setPathResult(selectedRes);
+    }).finally(() => { if (!cancelled) setPathLoading(false); });
+
+    return () => { cancelled = true; };
+  }, [rxPositions, selectedRxId, tx.lat, tx.lon, tx.height,
+      rx.height, rx.gain,
+      signal.frequency, signal.power, feeder.loss, antenna.gain,
+      model.name, model.diffraction]);
 
   const toggleLocale = useCallback(() => {
     const next = locale === 'fr' ? 'en' : 'fr';
@@ -154,13 +268,30 @@ export default function App() {
           erp_w={erp_w} erp_dbm={erp_dbm}
           eirp_w={eirp_w} eirp_dbm={eirp_dbm}
           megapixels={megapixels}
+          placementMode={placementMode}
+          setPlacementMode={setPlacementMode}
+          rxPositions={rxPositions}
+          selectedRxId={selectedRxId}
+          rxSignals={rxSignals}
+          onRxSelect={handleRxSelect}
+          onRxRemove={handleRxRemove}
+          onRxClearAll={handleRxClearAll}
         />
 
         <div className="flex-1 relative flex flex-col">
           <MapView
             onMapClick={handleMapClick}
+            onTxDragEnd={handleTxDragEnd}
+            onRxDragEnd={handleRxDragEnd}
+            onRxSelect={handleRxSelect}
             txPosition={txPosition}
+            rxPositions={rxPositions}
+            selectedRxId={selectedRxId}
+            placementMode={placementMode}
+            pathResult={pathResult}
+            pathHoverDistance={pathHover}
             coverageResult={result}
+            noiseFloor={env.noise_floor}
             darkMode={darkMode}
             locale={locale}
             outputUnits={output.units}
@@ -168,6 +299,16 @@ export default function App() {
             onTerrainLayerChange={setTerrainLayer}
             hasLidar={hasLidar}
             radius={output.radius}
+          />
+          {/* Path profile bottom panel */}
+          <PathProfilePanel
+            path={pathResult}
+            loading={pathLoading}
+            locale={locale}
+            onClose={handleRxClearAll}
+            onHoverDistance={setPathHover}
+            tx={{ lat: tx.lat, lon: tx.lon }}
+            rx={{ lat: selectedRx?.lat ?? null, lon: selectedRx?.lon ?? null }}
           />
           <Console
             messages={consoleMessages}

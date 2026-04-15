@@ -8,6 +8,8 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    host: true,
+    allowedHosts: ['rf.ve2fpd.com', '.ve2fpd.com', 'localhost'],
     proxy: {
       '/api': {
         target: 'http://localhost:8000',

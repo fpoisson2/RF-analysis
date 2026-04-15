@@ -560,9 +560,15 @@ MODELS = {
     },
     "itm": {
         "fn": itm,
-        "name": "Longley-Rice ITM",
+        "name": "Longley-Rice ITM (simplified)",
         "freq_range": (2, 20000),
-        "description": "Irregular Terrain Model - general purpose with terrain awareness",
+        "description": "Simplified ITM (educational) - free-space + statistical clutter",
+    },
+    "itm_ntia": {
+        "fn": None,  # filled in below if pyitm is available
+        "name": "Longley-Rice ITM (NTIA reference)",
+        "freq_range": (20, 20000),
+        "description": "Official NTIA reference implementation via pyitm — same engine as Radio Mobile / SPLAT!",
     },
     "los": {
         "fn": line_of_sight,
@@ -579,11 +585,24 @@ MODELS = {
 }
 
 
+# Lazy-load NTIA ITM (pyitm) and register if available
+try:
+    from .itm_ntia import itm_ntia as _itm_ntia, HAS_PYITM as _HAS_PYITM
+    if _HAS_PYITM:
+        MODELS["itm_ntia"]["fn"] = _itm_ntia
+    else:
+        MODELS.pop("itm_ntia", None)
+except Exception:
+    MODELS.pop("itm_ntia", None)
+
+
 def get_model(name: str):
     """Get a propagation model function by name."""
     model = MODELS.get(name)
     if model is None:
         raise ValueError(f"Unknown model: {name}. Available: {list(MODELS.keys())}")
+    if model["fn"] is None:
+        raise ValueError(f"Model '{name}' is not available (missing optional dependency)")
     return model["fn"]
 
 

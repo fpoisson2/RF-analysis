@@ -680,55 +680,245 @@ class CoverageEngine:
         tx_power_dbm = 10 * math.log10(power_w * 1000) if power_w > 0 else 0
 
         num_points = 200
-        distances, elevations = self.terrain.get_profile(
-            tx["lat"], tx["lon"], rx["lat"], rx["lon"], num_points
-        )
 
-        d_total = distances[-1]
+        prof = None
+        if hasattr(self.terrain, "get_profile_detailed"):
+            try:
+                prof = self.terrain.get_profile_detailed(
+                    tx["lat"], tx["lon"], rx["lat"], rx["lon"], num_points
+                )
+            except Exception:
+                prof = None
+
+        if prof is None:
+            distances, elevations = self.terrain.get_profile(
+                tx["lat"], tx["lon"], rx["lat"], rx["lon"], num_points
+            )
+            ground = np.asarray(elevations, dtype=np.float32)
+            surface = ground.copy()
+            canopy = np.zeros_like(ground)
+            distances = np.asarray(distances, dtype=np.float32)
+            lats = np.linspace(tx["lat"], rx["lat"], num_points).astype(np.float32)
+            lons = np.linspace(tx["lon"], rx["lon"], num_points).astype(np.float32)
+        else:
+            distances = prof["distances"]
+            ground = prof["ground"]
+            surface = prof["surface"]
+            canopy = prof["canopy_height"]
+            lats = prof["lats"]
+            lons = prof["lons"]
+
+        elevations = ground  # kept as the backwards-compat "terrain" series
+
+        d_total = float(distances[-1])
         prop_model = get_model(mdl["name"])
 
         signal_levels = np.zeros(num_points)
         fresnel_clearance = np.zeros(num_points)
+        fresnel_radius = np.zeros(num_points)
         los_clearance = np.zeros(num_points)
+        los_line = np.zeros(num_points)
+        path_loss_arr = np.zeros(num_points)
 
-        tx_elev = elevations[0] + tx_h
-        rx_elev = elevations[-1] + rx_h
+        tx_elev = float(ground[0]) + tx_h
+        rx_elev = float(ground[-1]) + rx_h
 
+        # Pass 1: LoS + Fresnel radius per point (needed before swath sampling)
         for i in range(num_points):
-            d_m = distances[i]
-            d_km = d_m / 1000.0
-            if d_km < 0.001:
-                signal_levels[i] = tx_power_dbm
-                continue
-
-            path_loss = float(np.atleast_1d(prop_model(d_km, freq, tx_h, rx_h))[0])
-            signal_levels[i] = tx_power_dbm - feeder_loss + ant_gain - path_loss + rx_gain
-
-            los_height = tx_elev + (rx_elev - tx_elev) * d_m / d_total
-            los_clearance[i] = los_height - elevations[i]
+            d_m = float(distances[i])
+            los_height = tx_elev + (rx_elev - tx_elev) * (d_m / d_total if d_total > 0 else 0.0)
+            los_line[i] = los_height
+            los_clearance[i] = los_height - float(surface[i])
 
             d_from_rx = d_total - d_m
             if d_m > 0 and d_from_rx > 0:
-                f1_radius = fresnel_zone_radius(d_m, d_from_rx, freq)
-                fresnel_clearance[i] = (los_height - elevations[i]) / f1_radius if f1_radius > 0 else 0
+                f1 = fresnel_zone_radius(d_m, d_from_rx, freq)
+                fresnel_radius[i] = f1
+                fresnel_clearance[i] = (los_height - float(surface[i])) / f1 if f1 > 0 else 0
+
+        # Compute a swath surface that also accounts for obstacles on the SIDES
+        # of the LoS line (within the Fresnel zone width). This matches the
+        # 3D Fresnel ellipsoid visualisation — obstacles off-axis that still
+        # penetrate the first Fresnel zone show up as obstructions.
+        try:
+            if hasattr(self.terrain, "get_swath_max_surface"):
+                swath = self.terrain.get_swath_max_surface(
+                    lats, lons, fresnel_radius, num_offsets=4
+                )
+                swath = np.asarray(swath, dtype=np.float32)
+                surface_detect = np.maximum(surface, swath)
+            else:
+                surface_detect = surface
+        except Exception:
+            surface_detect = surface
+
+        # ── Terrain diffraction loss (depends on antenna heights) ──
+        # The base propagation model (e.g. ITM area mode) only knows free-space
+        # plus a statistical clutter; it does NOT know about the actual
+        # obstacles on this specific link, so changing rx_h has almost no
+        # effect on its output. We add an explicit diffraction loss computed
+        # from the swath-max surface profile so that lifting RX above an
+        # obstacle correctly improves the received signal.
+        # Free-space and pure line-of-sight models intentionally ignore the
+        # terrain / obstacle environment, so we don't layer Deygout on top.
+        model_name = mdl.get("name", "")
+        skip_diffraction = model_name in ("free_space", "los")
+
+        diffraction_loss = 0.0
+        try:
+            diff_model = get_diffraction_model(
+                "none" if skip_diffraction else mdl.get("diffraction", "deygout94")
+            )
+            # The diffraction model uses heights[0]/heights[-1] as the *ground*
+            # below TX/RX and adds tx_h/rx_h on top. So we must pass GROUND at
+            # the endpoints (not surface_detect, which would include any tree
+            # or building right next to the antenna and lift it artificially).
+            heights_for_diff = np.asarray(surface_detect, dtype=float).copy()
+            heights_for_diff[0] = float(ground[0])
+            heights_for_diff[-1] = float(ground[-1])
+            diffraction_loss = float(diff_model(
+                np.asarray(distances, dtype=float),
+                heights_for_diff,
+                tx_h, rx_h, freq,
+            ))
+            if not np.isfinite(diffraction_loss) or diffraction_loss < 0:
+                diffraction_loss = 0.0
+        except Exception:
+            diffraction_loss = 0.0
+
+        # Reliability percentile from request (1-99). Models that accept it
+        # apply a confidence margin via inverse normal distribution.
+        reliability = float(mdl.get("reliability", 50))
+
+        # Pass 2: signal levels (now that diffraction_loss is known).
+        # When the model accepts a terrain profile (NTIA ITM, deygout-aware
+        # models), pass the ground array along the slice up to each sample.
+        for i in range(num_points):
+            d_km = float(distances[i]) / 1000.0
+            if d_km < 0.001:
+                signal_levels[i] = tx_power_dbm
+                path_loss_arr[i] = 0.0
+            else:
+                try:
+                    pl = float(np.atleast_1d(prop_model(
+                        d_km, freq, tx_h, rx_h,
+                        terrain_profile=ground[:i + 1],
+                        reliability=reliability,
+                    ))[0])
+                except TypeError:
+                    try:
+                        pl = float(np.atleast_1d(prop_model(
+                            d_km, freq, tx_h, rx_h, reliability=reliability,
+                        ))[0])
+                    except TypeError:
+                        pl = float(np.atleast_1d(prop_model(d_km, freq, tx_h, rx_h))[0])
+                pl_total = pl + diffraction_loss
+                path_loss_arr[i] = pl_total
+                signal_levels[i] = tx_power_dbm - feeder_loss + ant_gain - pl_total + rx_gain
+
+        # Per-sample Fresnel obstruction as a fraction of the circular
+        # cross-section area that is below the detected surface.
+        # For a circle of radius r centred on LoS, obstacle at height h:
+        #   c = los - h  (signed clearance)
+        #   A_obstructed = r² · arccos(c/r) − c · √(r² − c²)   for |c| ≤ r
+        #   fraction = A_obstructed / (π · r²)
+        # c > r: 0%. c < -r: 100%.
+        fresnel_obstruction_pct = np.zeros(num_points, dtype=np.float32)
+        for i in range(num_points):
+            r = float(fresnel_radius[i])
+            if r <= 0:
+                continue
+            c = float(los_line[i]) - float(surface_detect[i])
+            if c >= r:
+                continue
+            if c <= -r:
+                fresnel_obstruction_pct[i] = 100.0
+                continue
+            a = (r * r) * math.acos(c / r) - c * math.sqrt(r * r - c * c)
+            fresnel_obstruction_pct[i] = 100.0 * a / (math.pi * r * r)
+
+        # Identify obstructions: surface rises above LoS (hard block) or into
+        # Fresnel zone (soft block). Uses swath-max for cross-section width.
+        obstructions = []
+        i = 1
+        while i < num_points - 1:
+            if surface_detect[i] > los_line[i]:
+                # Hard block — LoS blocked (either on-axis or in the Fresnel cross-section)
+                start = i
+                peak = i
+                while i < num_points - 1 and surface_detect[i] > los_line[i]:
+                    if surface_detect[i] - los_line[i] > surface_detect[peak] - los_line[peak]:
+                        peak = i
+                    i += 1
+                obstructions.append({
+                    "type": "los",
+                    "start_m": float(distances[start]),
+                    "end_m": float(distances[i]),
+                    "peak_m": float(distances[peak]),
+                    "peak_elevation": float(surface_detect[peak]),
+                    "penetration_m": float(surface_detect[peak] - los_line[peak]),
+                    "canopy_height": float(canopy[peak]),
+                    "obstruction_pct": float(fresnel_obstruction_pct[peak]),
+                })
+            elif fresnel_radius[i] > 0 and (los_line[i] - surface_detect[i]) < 0.6 * fresnel_radius[i]:
+                # Inside 60% Fresnel zone — significant obstruction
+                start = i
+                peak = i
+                while (i < num_points - 1 and fresnel_radius[i] > 0
+                       and (los_line[i] - surface_detect[i]) < 0.6 * fresnel_radius[i]
+                       and surface_detect[i] <= los_line[i]):
+                    worst_prev = (los_line[peak] - surface_detect[peak]) / fresnel_radius[peak] if fresnel_radius[peak] > 0 else 1
+                    worst_cur = (los_line[i] - surface_detect[i]) / fresnel_radius[i] if fresnel_radius[i] > 0 else 1
+                    if worst_cur < worst_prev:
+                        peak = i
+                    i += 1
+                obstructions.append({
+                    "type": "fresnel",
+                    "start_m": float(distances[start]),
+                    "end_m": float(distances[i]),
+                    "peak_m": float(distances[peak]),
+                    "peak_elevation": float(surface_detect[peak]),
+                    "penetration_m": float(0.6 * fresnel_radius[peak] - (los_line[peak] - surface_detect[peak])),
+                    "canopy_height": float(canopy[peak]),
+                    "obstruction_pct": float(fresnel_obstruction_pct[peak]),
+                })
+            else:
+                i += 1
 
         path_bearing = bearing(tx["lat"], tx["lon"], rx["lat"], rx["lon"])
 
         return {
             "distances": distances.tolist(),
-            "elevations": elevations.tolist(),
+            "elevations": ground.tolist(),
+            "ground_elevations": ground.tolist(),
+            "surface_elevations": surface.tolist(),
+            "surface_detect": surface_detect.tolist(),
+            "fresnel_obstruction_pct": fresnel_obstruction_pct.tolist(),
+            "canopy_heights": canopy.tolist(),
+            "los_line": los_line.tolist(),
+            "fresnel_radius": fresnel_radius.tolist(),
             "signal_levels": signal_levels.tolist(),
+            "path_loss": path_loss_arr.tolist(),
             "fresnel_clearance": fresnel_clearance.tolist(),
             "los_clearance": los_clearance.tolist(),
+            "obstructions": obstructions,
             "stats": {
                 "distance_km": round(d_total / 1000, 2),
                 "bearing_deg": round(path_bearing, 1),
-                "tx_elevation": round(float(elevations[0]), 1),
-                "rx_elevation": round(float(elevations[-1]), 1),
-                "max_elevation": round(float(np.max(elevations)), 1),
-                "min_elevation": round(float(np.min(elevations)), 1),
+                "tx_elevation": round(float(ground[0]), 1),
+                "rx_elevation": round(float(ground[-1]), 1),
+                "tx_height_agl": round(tx_h, 1),
+                "rx_height_agl": round(rx_h, 1),
+                "max_elevation": round(float(np.max(ground)), 1),
+                "min_elevation": round(float(np.min(ground)), 1),
+                "max_surface": round(float(np.max(surface)), 1),
                 "signal_at_rx": round(float(signal_levels[-1]), 1),
+                "signal_at_rx_itm": round(float(signal_levels[-1]) + float(diffraction_loss), 1),
                 "free_space_loss": round(float(free_space(d_total / 1000, freq)), 1),
+                "diffraction_loss": round(float(diffraction_loss), 1),
+                "n_los_obstructions": sum(1 for o in obstructions if o["type"] == "los"),
+                "n_fresnel_obstructions": sum(1 for o in obstructions if o["type"] == "fresnel"),
+                "clear_path": len(obstructions) == 0,
             },
         }
 

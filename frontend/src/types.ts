@@ -74,12 +74,32 @@ export interface AreaResponse {
   computation_time_ms: number;
 }
 
+export interface PathObstruction {
+  type: 'los' | 'fresnel';
+  start_m: number;
+  end_m: number;
+  peak_m: number;
+  peak_elevation: number;
+  penetration_m: number;
+  canopy_height: number;
+  obstruction_pct?: number;
+}
+
 export interface PathResponse {
   distances: number[];
   elevations: number[];
+  ground_elevations?: number[];
+  surface_elevations?: number[];
+  canopy_heights?: number[];
+  los_line?: number[];
+  fresnel_radius?: number[];
+  surface_detect?: number[];
+  fresnel_obstruction_pct?: number[];
   signal_levels: number[];
+  path_loss?: number[];
   fresnel_clearance: number[];
   los_clearance: number[];
+  obstructions?: PathObstruction[];
   stats: Record<string, any>;
 }
 

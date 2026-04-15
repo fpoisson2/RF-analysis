@@ -27,6 +27,9 @@ data/vegetation/
 # ML training logs
 lightning_logs/
 
+# Runtime logs
+*.log
+
 # Claude Code local state
 .claude/scheduled_tasks.lock
 

@@ -88,10 +88,30 @@ class AreaResponse(BaseModel):
     computation_time_ms: float
 
 
+class PathObstruction(BaseModel):
+    type: str                    # "los" or "fresnel"
+    start_m: float
+    end_m: float
+    peak_m: float
+    peak_elevation: float
+    penetration_m: float
+    canopy_height: float
+    obstruction_pct: float = 0.0
+
+
 class PathResponse(BaseModel):
     distances: list[float]
-    elevations: list[float]
+    elevations: list[float]                  # alias for ground_elevations
+    ground_elevations: list[float] = []
+    surface_elevations: list[float] = []     # ground + canopy/buildings (MHC)
+    surface_detect: list[float] = []         # max surface within Fresnel cross-section
+    fresnel_obstruction_pct: list[float] = [] # % of Fresnel zone area obstructed, per sample
+    canopy_heights: list[float] = []
+    los_line: list[float] = []
+    fresnel_radius: list[float] = []
     signal_levels: list[float]
+    path_loss: list[float] = []
     fresnel_clearance: list[float]
     los_clearance: list[float]
+    obstructions: list[PathObstruction] = []
     stats: dict

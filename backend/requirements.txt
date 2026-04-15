@@ -6,9 +6,15 @@ pydantic>=2.9.0
 python-multipart>=0.0.9
 scipy>=1.13.0
 
-# Optional: GPU acceleration (uncomment for CUDA support)
-# cupy-cuda12x>=13.0.0
+# LiDAR + GIS
+rasterio>=1.3.0
+pyproj>=3.6.0
+shapely>=2.0.0
+laspy[lazrs]>=2.5.0
 
-# Optional: LiDAR support
-# laspy[lazrs]>=2.5.0
-# rasterio>=1.3.0
+# Propagation
+pyitm>=0.3        # NTIA Longley-Rice / ITM reference
+
+# GPU acceleration is installed by the Dockerfile (cupy-cuda12x +
+# nvidia-*-cu12 libraries) so it doesn't pollute the bare-metal install.
+# For local non-GPU dev: pip install -r requirements.txt + opencv-python-headless.

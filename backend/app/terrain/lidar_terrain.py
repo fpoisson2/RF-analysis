@@ -201,6 +201,169 @@ class LiDARTerrainManager:
 
         return distances, elevations
 
+    def _sample_surface(self, lat: float, lon: float) -> tuple[float, float]:
+        """Sample (ground, canopy_height) at a single (lat, lon). Returns
+        (NaN, 0) if outside LiDAR coverage."""
+        tile = self._find_tile(lat, lon)
+        if tile is None:
+            g = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+            return g, 0.0
+        x, y = self._transformer_to_local.transform(lon, lat)
+        g = 0.0
+        c = 0.0
+        mnt_ds = self._get_dataset(tile["mnt_path"], self._tiles_mnt)
+        if mnt_ds is not None:
+            try:
+                row, col = mnt_ds.index(x, y)
+                if 0 <= row < mnt_ds.height and 0 <= col < mnt_ds.width:
+                    g = float(mnt_ds.read(1, window=rasterio.windows.Window(col, row, 1, 1))[0, 0])
+                    if g < -1000 or np.isnan(g):
+                        g = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+            except Exception:
+                g = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+        if tile["mhc_path"]:
+            mhc_ds = self._get_dataset(tile["mhc_path"], self._tiles_mhc)
+            if mhc_ds is not None:
+                try:
+                    row, col = mhc_ds.index(x, y)
+                    if 0 <= row < mhc_ds.height and 0 <= col < mhc_ds.width:
+                        v = float(mhc_ds.read(1, window=rasterio.windows.Window(col, row, 1, 1))[0, 0])
+                        if not np.isnan(v) and v > 0:
+                            c = v
+                except Exception:
+                    pass
+        return g, c
+
+    def get_swath_max_surface(self, lats: np.ndarray, lons: np.ndarray,
+                               widths_m: np.ndarray, num_offsets: int = 5) -> np.ndarray:
+        """For each sample point, return the MAX surface elevation (ground+canopy)
+        within a ±widths_m/2 band perpendicular to the path direction.
+        Used for obstruction detection against the Fresnel zone width.
+        """
+        n = len(lats)
+        out = np.zeros(n, dtype=np.float32)
+        if n < 2 or not HAS_RASTERIO or not self._tile_index:
+            # fall back to centerline
+            for i in range(n):
+                g, c = self._sample_surface(float(lats[i]), float(lons[i]))
+                out[i] = g + c
+            return out
+
+        # Path bearing at each sample (using neighbors). In local tangent plane,
+        # perpendicular is rotated 90° from (dlon, dlat).
+        for i in range(n):
+            # centerline
+            g, c = self._sample_surface(float(lats[i]), float(lons[i]))
+            best = g + c
+
+            # finite-difference direction
+            i0 = max(0, i - 1)
+            i1 = min(n - 1, i + 1)
+            dlat = float(lats[i1] - lats[i0])
+            dlon = float(lons[i1] - lons[i0])
+            seg_m = math.hypot(dlat * 111320,
+                               dlon * 111320 * math.cos(math.radians(float(lats[i]))))
+            if seg_m <= 0:
+                out[i] = best
+                continue
+            # perpendicular unit vector (rotate +90° in lat/lon space, scaled for longitude)
+            cos_lat = math.cos(math.radians(float(lats[i])))
+            # normalize direction to meters, then perpendicular
+            dir_e = (dlon * cos_lat * 111320) / seg_m
+            dir_n = (dlat * 111320) / seg_m
+            perp_e = -dir_n
+            perp_n = dir_e
+            half = float(widths_m[i]) * 0.5
+            if half <= 0.5:
+                out[i] = best
+                continue
+            for k in range(1, num_offsets + 1):
+                off = half * (k / num_offsets)
+                for sign in (-1.0, 1.0):
+                    d_e = perp_e * off * sign
+                    d_n = perp_n * off * sign
+                    dlat_m = d_n / 111320.0
+                    dlon_m = d_e / (111320.0 * cos_lat)
+                    g2, c2 = self._sample_surface(float(lats[i]) + dlat_m,
+                                                    float(lons[i]) + dlon_m)
+                    v = g2 + c2
+                    if v > best:
+                        best = v
+            out[i] = best
+        return out
+
+    def get_profile_detailed(self, lat1: float, lon1: float,
+                              lat2: float, lon2: float,
+                              num_points: int = 200) -> dict:
+        """
+        Extract a profile with separated ground (MNT) and surface (MNT+MHC)
+        elevations. The canopy_height array is the MHC value at each sample —
+        positive means there's an obstacle (tree or building) above ground.
+
+        Returns a dict with numpy arrays: distances, lats, lons, ground, surface,
+        canopy_height. Falls back to get_profile() + zero canopy when LiDAR isn't
+        available.
+        """
+        lats = np.linspace(lat1, lat2, num_points)
+        lons = np.linspace(lon1, lon2, num_points)
+
+        ground = np.zeros(num_points, dtype=np.float32)
+        canopy = np.zeros(num_points, dtype=np.float32)
+
+        if not HAS_RASTERIO or not self._tile_index:
+            for i in range(num_points):
+                ground[i] = self.fallback.get_elevation(lats[i], lons[i]) if self.fallback else 0.0
+        else:
+            for i in range(num_points):
+                lat, lon = float(lats[i]), float(lons[i])
+                tile = self._find_tile(lat, lon)
+                if tile is None:
+                    ground[i] = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+                    continue
+
+                x, y = self._transformer_to_local.transform(lon, lat)
+
+                mnt_ds = self._get_dataset(tile["mnt_path"], self._tiles_mnt)
+                if mnt_ds is not None:
+                    try:
+                        row, col = mnt_ds.index(x, y)
+                        if 0 <= row < mnt_ds.height and 0 <= col < mnt_ds.width:
+                            g = float(mnt_ds.read(1, window=rasterio.windows.Window(col, row, 1, 1))[0, 0])
+                            if g < -1000 or np.isnan(g):
+                                g = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+                            ground[i] = g
+                    except Exception:
+                        ground[i] = self.fallback.get_elevation(lat, lon) if self.fallback else 0.0
+
+                if tile["mhc_path"]:
+                    mhc_ds = self._get_dataset(tile["mhc_path"], self._tiles_mhc)
+                    if mhc_ds is not None:
+                        try:
+                            row, col = mhc_ds.index(x, y)
+                            if 0 <= row < mhc_ds.height and 0 <= col < mhc_ds.width:
+                                c = float(mhc_ds.read(1, window=rasterio.windows.Window(col, row, 1, 1))[0, 0])
+                                if not np.isnan(c) and c > 0:
+                                    canopy[i] = c
+                        except Exception:
+                            pass
+
+        surface = ground + canopy
+
+        distances = np.zeros(num_points, dtype=np.float32)
+        for i in range(1, num_points):
+            dlat = (lats[i] - lats[i-1]) * 111320
+            dlon = (lons[i] - lons[i-1]) * 111320 * math.cos(math.radians(lats[i]))
+            distances[i] = distances[i-1] + math.sqrt(dlat**2 + dlon**2)
+
+        return {
+            "distances": distances,
+            "lats": lats.astype(np.float32),
+            "lons": lons.astype(np.float32),
+            "ground": ground,
+            "surface": surface,
+            "canopy_height": canopy,
+        }
+
     def get_elevation_grid(self, lat_center: float, lon_center: float,
                             radius_km: float, resolution_m: float,
                             use_canopy: bool = False) -> Tuple[np.ndarray, dict]:

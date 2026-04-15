@@ -1,37 +1,55 @@
-version: "3.9"
+# RF Coverage Analysis — local stack (CPU mode by default)
+#
+# Usage:
+#   CPU mode (any host):
+#     docker compose up -d --build
+#
+#   GPU mode (host with NVIDIA driver + nvidia-container-toolkit):
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Then open http://localhost:3000.
+#
+# Data layout (bind-mounted into the backend at /data):
+#   ./data/buildings/quebec_city_batiments.geojson
+#   ./data/lidar/quebec_city/{MNT,MHC}_21L1{3,4}{NE,NO,SE,SO}.tif
+#   ./data/output/    (caches; created at runtime)
+#
+# See DEPLOYMENT.md for fetching the LiDAR + buildings data.
+#
+# Notes:
+#   - The backend image bundles CuPy + CUDA libs but falls back to NumPy
+#     automatically when no GPU is exposed → the same image runs on
+#     CPU-only and GPU hosts.
+#   - First boot does ~90s of tree pre-indexing (LiDAR scan).
 
 services:
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    container_name: rf-backend
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - rf-data:/data
-      - ./data/srtm:/data/srtm
+      - ./data:/data
     environment:
-      - DATA_DIR=/data
       - PYTHONUNBUFFERED=1
-    # For CUDA GPU support, uncomment below:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    restart: unless-stopped
+      - DATA_DIR=/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/api/health\",timeout=3).status==200 else 1)'"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    ports:
-      - "3000:80"
+    container_name: rf-frontend
+    restart: unless-stopped
     depends_on:
       - backend
-    restart: unless-stopped
-
-volumes:
-  rf-data:
+    ports:
+      - "3000:80"
